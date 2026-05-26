@@ -227,11 +227,12 @@ class TestConfigInvariants:
         total = config.TCC_WEIGHT + config.TERRAIN_WEIGHT + config.LANDCOVER_WEIGHT
         assert total == pytest.approx(1.0, abs=1e-9)
 
-    def test_dual_batch_sizes_distinct_purposes(self) -> None:
-        # Raster sampling batch is much larger than the per-Claude-call batch,
-        # because they bottleneck on different things (memory vs API cost).
-        assert config.RASTER_BATCH_SIZE > config.CLAUDE_BATCH_SIZE
-        assert config.CLAUDE_BATCH_SIZE > 0
+    def test_raster_batch_size_positive(self) -> None:
+        # The legacy ``CLAUDE_BATCH_SIZE`` constant was removed in the Phase 7
+        # pipeline-orchestration redesign: Claude no longer reasons per batch
+        # of locations, so a per-Claude-call batch size is no longer relevant.
+        # ``RASTER_BATCH_SIZE`` remains because it governs how many rows the
+        # Environmental Agent processes per raster-handle-warmup cycle.
         assert config.RASTER_BATCH_SIZE > 0
 
     def test_nlcd_code_groups_are_disjoint(self) -> None:

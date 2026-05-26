@@ -46,15 +46,36 @@ for _d in (TCC_DIR, LC_DIR, DEM_DIR, PROCESSED_DIR, SCORED_DIR, LOG_DIR):
 
 # --- API ---
 ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
+
+# --- Agent Configuration ---
+# Pipeline-orchestration design (Phase 7 redesign): Claude makes ONE API call
+# and orchestrates 5 pipeline-level tools. Each tool internally runs the full
+# dataset through the existing Phase 1-6 agents. No per-batch Claude reasoning
+# at scale — the per-location reasoning surface is preserved only in the
+# interactive mode (single-location query, ~$0.01 per call).
 CLAUDE_MODEL: str = "claude-sonnet-4-6"
-CLAUDE_MAX_TOKENS: int = 1024
+CLAUDE_MAX_TOKENS: int = 4096        # Headroom for the orchestrator's end-of-run summary text.
 CLAUDE_TEMPERATURE: int = 0          # Deterministic — required for reproducible scoring.
-CLAUDE_BATCH_SIZE: int = 50          # Locations per Claude API call. Tune to your spend ceiling.
+MAX_AGENT_TURNS: int = 20            # Safety cap on tool call turns in the orchestrator loop.
+DEMO_SAMPLE_SIZE: int | None = None  # None = full dataset. Set to int for testing (e.g. 10_000).
+
+# --- Full scale cost projection (documented for README) ---
+# At pipeline-orchestration design (5 tools, 1 Claude call):
+# Total API cost for full 4.67M row run: < $1.00
+# Token usage: ~2,000 input + ~1,500 output = ~3,500 tokens total
+# Compare: per-batch design at 100 locations/call = ~$10,600 for full dataset
+
+# --- Claude pricing (USD per 1M tokens) ---
+# Sourced from Anthropic's published Claude Sonnet 4 pricing. Lives in
+# config so the cost-estimate log emitted on every Claude response can be
+# re-tuned without re-deploying the orchestrator if pricing ever changes.
+CLAUDE_INPUT_COST_PER_MTOK: float = 3.00
+CLAUDE_OUTPUT_COST_PER_MTOK: float = 15.00
 
 # --- Processing ---
 # Raster sampling is done in large in-memory batches for I/O efficiency.
-# Intentionally separate from CLAUDE_BATCH_SIZE — these are two different operations
-# with different bottlenecks (memory vs. API cost / latency).
+# Each chunk opens the raster handles once and reuses them for the whole chunk
+# (see EnvironmentalAgent.enrich_batch + the per-tool dataset caches).
 RASTER_BATCH_SIZE: int = 50_000
 
 # --- Continental US bounding box (for coordinate validation) ---
