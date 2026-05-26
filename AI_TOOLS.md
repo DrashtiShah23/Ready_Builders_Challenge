@@ -23,7 +23,11 @@ The two entries below are cases where Cursor's generated code deviated from the 
    - This is data, not logic — it belongs in config alongside the existing `FOREST_CODES` / `DEVELOPED_CODES` / `OPEN_CODES` lists. Putting it anywhere else would split the NLCD classification information across two files.
    - **Decision: kept Cursor's addition.** Flagged here because it is a content addition not requested by the build plan.
 
-3. _[To be filled as further deviations occur during the build]_
+3. **`ds.sample(...)` over a cached file handle, instead of `src.read(1)[row, col]` on a fresh open per call** (Phase 3, `src/tools/tcc.py`, `src/tools/landcover.py`, and the slope read in `src/tools/elevation.py`).
+   - The build plan's literal `fetch_tcc` body opens the GeoTIFF on every call and uses `src.read(1)[row, col]`, which loads the full ~3 GB NLCD band into memory for a single-pixel answer. That would be unusable at 1M points — both memory-blowout and I/O-bound — and it directly contradicts the build plan's own Phase 5 design note: "rasterio file handles are expensive to open. We open each raster file ONCE per batch."
+   - Cursor implemented the equivalent corrected version: a module-level lazy-opened dataset cache, `ds.sample([(x, y)])` for the actual pixel read (which only reads the single tile that contains the point), and a public `_reset_cache()` helper so tests and pipeline shutdown can close handles cleanly.
+   - The two changes are semantically identical at the per-call level (same input → same output for a single point) but make batch-scale execution feasible. Without this change, Phase 5's "open file handles once per batch" design has nothing to bind to.
+   - **Decision: kept Cursor's deviation.** Flagged here because the source body materially differs from the literal Phase 3 code in `MASTER_BUILD_PLAN.md`, and because it's the largest implementation change I've made off-spec so far.
 
 ## Phase 2 — Data Downloader decisions
 
@@ -34,3 +38,13 @@ The two entries below are cases where Cursor's generated code deviated from the 
 5. I added `--skip-tcc`, `--skip-landcover`, and `--skip-slope` CLI flags beyond what the build plan asked for, because the bare `--states` flag still triggers ~6 GB of downloads, and I needed a way to smoke-test the CLI from pytest without burning bandwidth.
 6. `STATE_FIPS` is CONUS-only (no AK/HI/territories), because the Starlink install guide and the Ready challenge brief both target the lower 48 + DC, and adding a state later is a one-line config change rather than a code rewrite.
 7. DEM rasters are not downloaded during tests — the real integration test is the first manual `python -m src.data.downloader --states CA` run — because each tile is ~100 MB+ and pulling them on every test run would make the suite uselessly slow without testing anything that mocks + a synthetic GeoTIFF don't already cover.
+
+## Phase 3 — Tools decisions
+
+1. Each tool keeps its open rasterio dataset in a module-level cache and only reopens it when the underlying file path changes, because `rasterio.open` parses headers and allocates buffers — doing that on every call at 1M points would dominate runtime.
+2. Aspect is computed per-point from a 3x3 windowed DEM read rather than pre-computed in Phase 2, because Phase 2 is already merged and the v3.0 scoring formula doesn't use aspect in the composite (only Claude's anomaly-reasoning does), so the per-point cost is acceptable and the alternative would have meant reopening Phase 2's downloader.
+3. The DEM handle cache is LRU-capped at 16 open files instead of holding every tile open, because a 49-state CONUS run can produce hundreds of tiles and the OS file-descriptor table is not generous enough to hold them all simultaneously.
+4. Unknown NLCD codes return `"Unknown (<code>)"` as the class name rather than raising or returning `None`, because dropping the raw integer would lose information that the analysis report and Claude's anomaly check both find useful — the value is still flagged via the class string.
+5. The NoData sentinel for TCC is hard-coded as 255 *and* falls back to the dataset's declared `nodata` field, because the NLCD docs publish 255 as the canonical TCC NoData but the GeoTIFF metadata occasionally disagrees, and a missing-data classification should not depend on which source is correct.
+6. TCC values outside [0, 100] are flagged as missing rather than passed through, because the NLCD legend caps canopy density at 100% and any out-of-range value indicates either a misinterpreted byte or corrupted sample — silently feeding garbage into the scoring formula would be worse than logging a clear flag.
+7. Each tool exposes a `_reset_cache()` helper, because tests need to swap raster fixtures between cases without leaked file handles, and the pipeline's shutdown handler (Phase 8) needs a single clean exit point that releases every open dataset.
