@@ -188,7 +188,11 @@ def test_real_run_wires_progress_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert stub.on_tool_start is pipeline_mod._on_tool_start
     assert stub.on_tool_end is pipeline_mod._on_tool_end
-    stub.run.assert_called_once_with("fake.csv", sample_size=10)
+    # Batch mode now threads the Phase 8 ``states`` and ``resume`` knobs
+    # through to ``run()``, even when the CLI defaults were taken.
+    stub.run.assert_called_once_with(
+        "fake.csv", sample_size=10, states=None, resume=False
+    )
 
 
 def test_interactive_requires_lat_lon(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,3 +237,158 @@ def test_progress_hooks_format(capfd: pytest.CaptureFixture[str]) -> None:
     out, _err = capfd.readouterr()
     assert ">>> Running ingest_locations..." in out
     assert "<<< ingest_locations complete in 1.2s | tokens: 100in 50out" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: --states, --resume, --mode, Ctrl+C handling
+# ---------------------------------------------------------------------------
+
+
+class TestStatesFlag:
+    def test_states_threaded_to_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        pipeline_mod.main(["--csv", "fake.csv", "--states", "NC", "CA"])
+        stub.run.assert_called_once_with(
+            "fake.csv", sample_size=None, states=["NC", "CA"], resume=False
+        )
+
+    def test_states_default_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        pipeline_mod.main(["--csv", "fake.csv"])
+        _, kwargs = stub.run.call_args
+        assert kwargs["states"] is None
+
+
+class TestResumeFlag:
+    def test_resume_threaded_to_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        pipeline_mod.main(["--csv", "fake.csv", "--resume"])
+        stub.run.assert_called_once_with(
+            "fake.csv", sample_size=None, states=None, resume=True
+        )
+
+    def test_resume_default_is_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        pipeline_mod.main(["--csv", "fake.csv"])
+        _, kwargs = stub.run.call_args
+        assert kwargs["resume"] is False
+
+
+class TestModeFlag:
+    def test_mode_dry_run_takes_dry_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        rc = pipeline_mod.main(["--csv", "fake.csv", "--mode", "dry-run"])
+        assert rc == 0
+        stub.run.assert_not_called()
+        stub._run_ingest_locations.assert_called_once()
+
+    def test_mode_interactive_takes_interactive_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        rc = pipeline_mod.main(
+            ["--mode", "interactive", "--lat", "35.5", "--lon", "-80.0"]
+        )
+        assert rc == 0
+        stub.run_interactive.assert_called_once_with(35.5, -80.0)
+
+    def test_mode_batch_is_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        pipeline_mod.main(["--csv", "fake.csv"])
+        stub.run.assert_called_once()
+
+    def test_legacy_interactive_flag_still_works(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        rc = pipeline_mod.main(
+            ["--interactive", "--lat", "35.5", "--lon", "-80.0"]
+        )
+        assert rc == 0
+        stub.run_interactive.assert_called_once_with(35.5, -80.0)
+
+    def test_legacy_dry_run_flag_still_works(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        rc = pipeline_mod.main(["--csv", "fake.csv", "--dry-run"])
+        assert rc == 0
+        stub.run.assert_not_called()
+
+
+class TestSigintHandler:
+    def test_keyboard_interrupt_exit_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``KeyboardInterrupt`` raised mid-run must exit 130, not crash."""
+        stub = _build_orchestrator_stub()
+        stub.run.side_effect = KeyboardInterrupt()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+
+        rc = pipeline_mod.main(["--csv", "fake.csv"])
+        assert rc == 130
+
+
+class TestResolveMode:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["--csv", "x"], "batch"),
+            (["--csv", "x", "--mode", "batch"], "batch"),
+            (["--csv", "x", "--mode", "dry-run"], "dry-run"),
+            (["--csv", "x", "--mode", "interactive"], "interactive"),
+            (["--csv", "x", "--dry-run"], "dry-run"),
+            (["--csv", "x", "--interactive"], "interactive"),
+            # Legacy flag wins over an opposite explicit mode (Phase 7 behaviour).
+            (["--csv", "x", "--mode", "batch", "--dry-run"], "dry-run"),
+        ],
+    )
+    def test_resolve_mode(self, argv: list[str], expected: str) -> None:
+        args = pipeline_mod._parse_args(argv)
+        assert pipeline_mod._resolve_mode(args) == expected

@@ -7,14 +7,17 @@ Batch mode (full pipeline run):
 
     python pipeline.py --csv data/locations.csv
     python pipeline.py --csv data/locations.csv --sample 10000
+    python pipeline.py --csv data/locations.csv --states NC CA
+    python pipeline.py --csv data/locations.csv --resume
 
 Dry-run mode (smoke-test pipeline structure with NO Claude API spend):
 
     python pipeline.py --csv data/locations.csv --dry-run
+    python pipeline.py --csv data/locations.csv --mode dry-run
 
 Interactive mode (single coordinate):
 
-    python pipeline.py --interactive --lat 35.06 --lon -80.66
+    python pipeline.py --mode interactive --lat 35.06 --lon -80.66
 
 Design notes
 ------------
@@ -26,14 +29,21 @@ into the orchestrator (single Claude call, five pipeline-level tools), so
 * parse CLI args,
 * instantiate the structured logger,
 * construct the orchestrator with the API key,
-* wire real-time progress prints to the orchestrator's tool hooks, and
+* install Ctrl+C handling and real-time progress hooks, and
 * dispatch into ``run`` (batch), ``run_interactive`` (single point), or
   ``run_dry`` (no Claude, just execute the five tool internals).
+
+Phase 8 additions: ``--states`` filter (post-ingestion), ``--resume`` (each
+tool short-circuits when its output parquet already exists), ``--mode`` as
+the canonical mode selector (``--interactive`` / ``--dry-run`` stay as
+aliases for backward compatibility with Phase 7), and a clean ``SIGINT``
+handler that emits a ``PIPELINE_INTERRUPTED`` log event before exit.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import time
 import uuid
@@ -218,8 +228,37 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Ctrl+C handling
+# ---------------------------------------------------------------------------
+
+
+def _install_sigint_handler(logger: PipelineLogger) -> None:
+    """Install a SIGINT handler that logs a checkpoint before exiting.
+
+    Without this, Ctrl+C during a long enrichment leaves no breadcrumb
+    in the JSONL log for the metrics module (Phase 11) to discover. The
+    handler converts the signal into a clean ``PIPELINE_INTERRUPTED``
+    event, then re-raises ``KeyboardInterrupt`` so the main loop's
+    ``except`` block in :func:`main` can finalise the exit code.
+    """
+    def _handle(signum: int, _frame: Any) -> None:
+        logger.warning(
+            stage="pipeline",
+            event_type="PIPELINE_INTERRUPTED",
+            detail={"signal": signum, "note": "SIGINT received"},
+        )
+        # Re-raise as KeyboardInterrupt so ``main`` can branch on it.
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGINT, _handle)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+_MODES = ("batch", "interactive", "dry-run")
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -248,26 +287,62 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--dry-run",
+        "--states",
+        nargs="+",
+        default=None,
+        metavar="STATE",
+        help=(
+            "Limit ingestion to one or more state abbreviations "
+            "(e.g. --states NC CA). Case-insensitive."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
         action="store_true",
         help=(
-            "Run the 5 pipeline tools directly without calling Claude. "
-            "Forces sample_size=100. Use to verify pipeline structure "
-            "before spending any tokens."
+            "Skip any pipeline step whose output parquet already exists "
+            "on disk. Use to recover from a crashed run without re-paying "
+            "the raster-enrichment cost."
         ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=_MODES,
+        default="batch",
+        help=(
+            "Pipeline mode. 'batch' (default) runs the full flow. "
+            "'interactive' scores one lat/lon. 'dry-run' executes the "
+            "5 tools without calling Claude."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Alias for --mode dry-run (kept for backward compatibility).",
     )
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Run interactive mode for a single coordinate.",
+        help="Alias for --mode interactive (kept for backward compatibility).",
     )
     parser.add_argument("--lat", type=float, help="Latitude for interactive mode.")
     parser.add_argument("--lon", type=float, help="Longitude for interactive mode.")
     return parser.parse_args(argv)
 
 
+def _resolve_mode(args: argparse.Namespace) -> str:
+    """Reconcile ``--mode`` with the legacy ``--interactive`` / ``--dry-run``
+    boolean flags. The legacy switches win when they're set, mirroring the
+    Phase 7 behaviour, but ``--mode`` is what new docs reference."""
+    if args.dry_run:
+        return "dry-run"
+    if args.interactive:
+        return "interactive"
+    return args.mode
+
+
 def _require_api_key(allow_missing: bool) -> Optional[str]:
-    """Return the API key, or None if dry-run mode tolerates its absence."""
+    """Return the API key, or None if the current mode tolerates its absence."""
     api_key = config.ANTHROPIC_API_KEY
     if api_key:
         return api_key
@@ -286,12 +361,14 @@ def _require_api_key(allow_missing: bool) -> Optional[str]:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
+    mode = _resolve_mode(args)
 
-    api_key = _require_api_key(allow_missing=args.dry_run)
+    api_key = _require_api_key(allow_missing=(mode == "dry-run"))
     if api_key is None:
         return 2
 
     logger = PipelineLogger(run_id=f"pipeline-{uuid.uuid4().hex[:8]}")
+    _install_sigint_handler(logger)
     orchestrator = PipelineOrchestrator(api_key=api_key, logger=logger)
 
     # Wire the real-time progress hooks. The orchestrator invokes them
@@ -301,37 +378,54 @@ def main(argv: Optional[list[str]] = None) -> int:
     orchestrator.on_tool_start = _on_tool_start
     orchestrator.on_tool_end = _on_tool_end
 
-    if args.dry_run:
-        # Dry-run never hits Claude. Force sample_size=100 (per spec) so a
-        # 4.67M-row CSV doesn't get fully ingested just to smoke-test the
-        # call chain.
-        result = _run_dry(orchestrator, args.csv, sample_size=100)
-        print(
-            "\nDry-run summary:\n"
-            f"{json.dumps({'status': result['status']}, indent=2)}"
-        )
-        return 0 if result["status"] == "dry_run_ok" else 1
-
-    if args.interactive:
-        if args.lat is None or args.lon is None:
+    try:
+        if mode == "dry-run":
+            result = _run_dry(orchestrator, args.csv, sample_size=100)
             print(
-                "ERROR: --interactive requires --lat and --lon.",
-                file=sys.stderr,
+                "\nDry-run summary:\n"
+                f"{json.dumps({'status': result['status']}, indent=2)}"
             )
-            return 2
-        result = orchestrator.run_interactive(args.lat, args.lon)
-        print(json.dumps(result, indent=2, default=str))
-        return 0
+            return 0 if result["status"] == "dry_run_ok" else 1
 
-    sample_size = args.sample if args.sample is not None else config.DEMO_SAMPLE_SIZE
-    result = orchestrator.run(args.csv, sample_size=sample_size)
-    print(result.get("final_text", ""))
-    print(
-        "\nRun cost: $"
-        f"{estimate_cost_usd(result['total_input_tokens'], result['total_output_tokens']):.4f} "
-        f"({result['total_input_tokens']}in {result['total_output_tokens']}out tokens)"
-    )
-    return 0
+        if mode == "interactive":
+            if args.lat is None or args.lon is None:
+                print(
+                    "ERROR: interactive mode requires --lat and --lon.",
+                    file=sys.stderr,
+                )
+                return 2
+            result = orchestrator.run_interactive(args.lat, args.lon)
+            print(json.dumps(result, indent=2, default=str))
+            return 0
+
+        # mode == "batch"
+        sample_size = (
+            args.sample if args.sample is not None else config.DEMO_SAMPLE_SIZE
+        )
+        result = orchestrator.run(
+            args.csv,
+            sample_size=sample_size,
+            states=args.states,
+            resume=args.resume,
+        )
+        print(result.get("final_text", ""))
+        print(
+            "\nRun cost: $"
+            f"{estimate_cost_usd(result['total_input_tokens'], result['total_output_tokens']):.4f} "
+            f"({result['total_input_tokens']}in {result['total_output_tokens']}out tokens)"
+        )
+        return 0
+    except KeyboardInterrupt:
+        # The SIGINT handler already wrote ``PIPELINE_INTERRUPTED`` to the
+        # JSONL log. Surface a one-line user-facing summary too — distinct
+        # from the regular completion banner so a tail of stdout makes the
+        # cause of exit obvious.
+        print(
+            "\n[INTERRUPTED] Pipeline halted by SIGINT. Re-run with "
+            "--resume to continue from the last completed step.",
+            flush=True,
+        )
+        return 130  # POSIX convention: 128 + SIGINT (2)
 
 
 if __name__ == "__main__":
