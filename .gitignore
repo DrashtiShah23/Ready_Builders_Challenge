@@ -1,7 +1,7 @@
 # Raw data — never commit
-data/
-outputs/
-logs/
+/data/
+/outputs/
+/logs/
 
 # Personal working files — never commit
 PROGRESS.md
