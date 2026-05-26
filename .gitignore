@@ -1,0 +1,38 @@
+# Raw data — never commit
+data/
+outputs/
+logs/
+
+# Personal working files — never commit
+PROGRESS.md
+MASTER_BUILD_PLAN.md
+*.local.md
+scratch/
+notebooks/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.env
+
+# Raster files — large, never commit
+*.tif
+*.tiff
+*.img
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+
+# API keys — NEVER EVER commit
+*.key
+secrets.json
