@@ -150,6 +150,13 @@ STATE_FIPS: dict[str, str] = {
     "WY": "56",
 }
 
+# Reverse lookup: FIPS code (e.g. "37") -> state abbreviation (e.g. "NC").
+# Derived from STATE_FIPS so the two stay in sync automatically. Non-CONUS
+# FIPS codes (AK=02, HI=15, PR=72, etc.) are intentionally absent — any
+# row whose Census GEOID resolves to one of those codes is out of scope
+# for this CONUS-only pipeline.
+STATE_FIPS_TO_ABBR: dict[str, str] = {fips: abbr for abbr, fips in STATE_FIPS.items()}
+
 # --- USGS National Map endpoints (versioned for reproducibility) ---
 TNM_API_BASE: str = "https://tnmaccess.nationalmap.gov/api/v1/products"
 TNM_DEM_DATASET: str = "National Elevation Dataset (NED) 1 arc-second"

@@ -15,7 +15,11 @@ import pandas as pd
 import pytest
 
 from src import config
-from src.agents.ingestion import IngestionAgent, Reason
+from src.agents.ingestion import (
+    IngestionAgent,
+    Reason,
+    _derive_state_county_from_geoid,
+)
 from src.schemas.location import ValidatedLocation
 
 
@@ -372,6 +376,175 @@ class TestTwentyRowSpec:
 # ---------------------------------------------------------------------------
 # Streaming behaviour
 # ---------------------------------------------------------------------------
+
+
+class TestGeoidDerivation:
+    """Phase 4 follow-up: derive state + county from the ``geoid_cb``
+    column when the CSV omits or nulls the explicit ``state`` field.
+
+    A Census Block GEOID looks like ``371790203162002`` (15 digits,
+    2 state + 3 county + 6 tract + 4 block). The first 2 digits are the
+    state FIPS, the first 5 are the canonical county GEOID.
+    """
+
+    # ------------------------------------------------------------------ helper
+
+    @pytest.mark.parametrize(
+        "geoid, expected",
+        [
+            # Canonical 15-digit CONUS GEOIDs — must derive.
+            ("371790203162002", ("NC", "37179")),         # NC / Union County
+            ("060375022101001", ("CA", "06037")),         # CA / Los Angeles
+            ("480290001011000", ("TX", "48029")),         # TX / Bexar
+            ("010730011022002", ("AL", "01073")),         # AL (FIPS starts with 0)
+            ("090010001011000", ("CT", "09001")),         # CT (FIPS 09)
+            # Int input is accepted iff its string form is exactly 15 digits.
+            (371790203162002 , ("NC", "37179")),
+            # Non-CONUS state FIPS are deliberately not in STATE_FIPS_TO_ABBR.
+            ("020130000100100", (None, None)),            # AK
+            ("150030000100100", (None, None)),            # HI
+            ("720010000100100", (None, None)),            # Puerto Rico
+            ("780100000100100", (None, None)),            # US Virgin Islands
+            # Length / character validation.
+            ("notdigits"      , (None, None)),
+            (""               , (None, None)),
+            (None             , (None, None)),
+            ("12345"          , (None, None)),            # too short
+            ("01001020100100" , (None, None)),            # 14 chars — ambiguous,
+                                                          # refuse on principle
+            ("9999999999999999", (None, None)),           # 16 chars — malformed
+            ("999999999999999", (None, None)),            # 15 digits but invalid
+                                                          # FIPS prefix (99)
+        ],
+    )
+    def test_derive_helper_table(self, geoid, expected):
+        assert _derive_state_county_from_geoid(geoid) == expected
+
+    # ----------------------------------------------------------- end-to-end CSV
+
+    def test_csv_with_only_geoid_derives_state_and_county(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # No `state` or `county` columns — geoid is the only source.
+        # Both rows use canonical 15-digit GEOIDs, including AL (leading 0).
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66,
+             "geoid_cb": "371790203162002"},
+            {"location_id": "L2", "latitude": 33.45, "longitude": -86.79,
+             "geoid_cb": "010730011022002"},
+        ]
+        csv = _write_csv(tmp_path / "geoid_only.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert len(batch) == 2
+        assert batch[0].state == "NC"
+        assert batch[0].county == "37179"
+        assert batch[1].state == "AL"
+        assert batch[1].county == "01073"
+
+    def test_explicit_state_wins_over_geoid(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # CSV has BOTH `state` and `geoid_cb`. The user-supplied state must
+        # be used as-is; the geoid is ignored entirely (including its county).
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66,
+             "state": "CA", "county": "user-county",
+             "geoid_cb": "371790203162002"},   # would derive NC / 37179
+        ]
+        csv = _write_csv(tmp_path / "explicit_wins.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state == "CA"
+        assert batch[0].county == "user-county"
+
+    def test_null_state_falls_back_to_geoid(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # `state` column present but null on this row → geoid takes over.
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66,
+             "state": None, "county": None, "geoid_cb": "371790203162002"},
+        ]
+        csv = _write_csv(tmp_path / "null_state.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state == "NC"
+        assert batch[0].county == "37179"
+
+    def test_explicit_county_preserved_when_only_state_derived(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # User supplied county directly but no state. Geoid fills state but
+        # MUST NOT overwrite the user's county string.
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66,
+             "county": "Mecklenburg", "geoid_cb": "371790203162002"},
+        ]
+        csv = _write_csv(tmp_path / "user_county.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state == "NC"
+        assert batch[0].county == "Mecklenburg"
+
+    def test_non_conus_geoid_leaves_state_none_and_row_passes(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # Alaska FIPS (02). Derivation returns (None, None) so state stays
+        # null. The row still passes ingestion as long as its lat/lon are
+        # inside CONUS — the geoid simply contributes nothing.
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66,
+             "geoid_cb": "020130000100100"},
+        ]
+        csv = _write_csv(tmp_path / "ak_geoid.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state is None
+        assert batch[0].county is None
+
+    def test_geoid_with_stripped_leading_zero_intentionally_refused(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # 14-digit input (exporter stripped the leading zero for an AL row).
+        # The helper deliberately refuses these because the FIPS prefixes 10–19
+        # collide. Row still ingests with state=None — strictly safer than
+        # mis-attributing.
+        rows = [
+            {"location_id": "L1", "latitude": 33.45, "longitude": -86.79,
+             "geoid_cb": "10730011022002"},
+        ]
+        csv = _write_csv(tmp_path / "short_geoid.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state is None
+        assert batch[0].county is None
+
+    def test_malformed_geoid_leaves_state_none_and_row_passes(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66,
+             "geoid_cb": "not-a-geoid"},
+        ]
+        csv = _write_csv(tmp_path / "bad_geoid.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state is None
+
+    def test_csv_without_geoid_column_still_works(
+        self, tmp_path: Path, logger: _CaptureLogger
+    ) -> None:
+        # Backward compat: legacy CSV with no geoid_cb at all should still
+        # ingest cleanly with state=None.
+        rows = [
+            {"location_id": "L1", "latitude": 35.06, "longitude": -80.66},
+        ]
+        csv = _write_csv(tmp_path / "no_geoid.csv", rows)
+        agent = IngestionAgent(logger=logger)  # type: ignore[arg-type]
+        [batch] = list(agent.run(csv, batch_size=10))
+        assert batch[0].state is None
+        assert batch[0].county is None
 
 
 class TestStreaming:
