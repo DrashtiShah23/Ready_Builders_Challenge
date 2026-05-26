@@ -32,6 +32,14 @@ Reason codes
 ``OUT_OF_BOUNDS``     — coordinate outside the CONUS bounding box
 ``INVALID_STATE``     — ``state`` provided but not in ``config.STATE_FIPS``
 ``DUPLICATE_DROPPED`` — ``location_id`` already seen in this run
+
+Geoid derivation
+----------------
+If the CSV exposes a ``geoid_cb`` column (15-digit Census Block GEOID) and the
+row's ``state`` is missing or null, state and county are derived from the
+GEOID prefix: digits 1–2 = state FIPS, digits 1–5 = canonical county GEOID.
+Explicit user-supplied ``state`` always wins — derivation is the fallback,
+not an override.
 """
 from __future__ import annotations
 
@@ -75,7 +83,55 @@ def _is_null(value: Any) -> bool:
         return True
     if isinstance(value, str) and value.strip() == "":
         return True
+    # pandas.NA, numpy.nan, and other scalar nulls.
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        # ``pd.isna`` raises on unhashable / array-like inputs, which we
+        # don't expect here but want to gracefully treat as "not null".
+        pass
     return False
+
+
+def _derive_state_county_from_geoid(
+    geoid_raw: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Derive (state_abbr, county_geoid) from a Census Block GEOID.
+
+    A Census Block GEOID is canonically 15 digits:
+        2 (state FIPS) + 3 (county FIPS) + 6 (tract) + 4 (block).
+    We use the first 2 chars for the state lookup and the first 5 chars
+    (state + county FIPS) as the canonical county identifier — that
+    5-digit form is the standard Census GEOID for a county and is
+    unambiguous across state boundaries.
+
+    Strict input contract: exactly 15 digits. No zero-padding, no
+    leniency. Why: an exporter that strips the leading zero from
+    ``"01..."`` (Alabama) leaves ``"1..."``, which is indistinguishable
+    from the legitimate FIPS prefixes ``10``–``19`` (DE, DC, FL, GA, HI,
+    ID, IL, IN, IA). Without a way to disambiguate, the conservative
+    answer is to refuse to derive for any input that isn't already a
+    full 15-digit GEOID. Callers see ``(None, None)`` and the affected
+    rows simply pass through with ``state=None`` — the explicit
+    ``state`` column on the input CSV (if any) remains the override.
+
+    Returns ``(None, None)`` for: null inputs, non-numeric strings,
+    inputs of any length other than 15, or any GEOID whose state FIPS
+    isn't a CONUS state we recognise (AK=02, HI=15, PR=72 etc. all fall
+    here — they are out of scope for this pipeline).
+    """
+    if _is_null(geoid_raw):
+        return None, None
+    text = str(geoid_raw).strip()
+    if len(text) != 15 or not text.isdigit():
+        return None, None
+    state_fips = text[:2]
+    county_geoid = text[:5]
+    state_abbr = config.STATE_FIPS_TO_ABBR.get(state_fips)
+    if state_abbr is None:
+        return None, None
+    return state_abbr, county_geoid
 
 
 class IngestionAgent:
@@ -155,6 +211,17 @@ class IngestionAgent:
         # --- Pydantic: coercion + type validation ---
         state_raw = record.get("state")
         county_raw = record.get("county")
+        # Fallback: derive state (and county GEOID) from `geoid_cb` when the
+        # explicit `state` field is missing or null. User-provided state
+        # always wins over derived state.
+        if _is_null(state_raw):
+            derived_state, derived_county = _derive_state_county_from_geoid(
+                record.get("geoid_cb")
+            )
+            if derived_state is not None:
+                state_raw = derived_state
+                if _is_null(county_raw):
+                    county_raw = derived_county
         try:
             parsed = RawLocation(
                 location_id=location_id,
@@ -258,7 +325,16 @@ class IngestionAgent:
         chunk_iter = pd.read_csv(
             csv_path,
             chunksize=CHUNK_SIZE,
-            dtype={"location_id": "string", "state": "string", "county": "string"},
+            # ``geoid_cb`` is forced to string so leading zeros (state FIPS
+            # codes 01–09) survive the read. pandas silently ignores dtype
+            # keys for columns that aren't present, so this is backward-
+            # compatible with CSVs that don't include the column.
+            dtype={
+                "location_id": "string",
+                "state": "string",
+                "county": "string",
+                "geoid_cb": "string",
+            },
             keep_default_na=True,
         )
 
