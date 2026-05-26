@@ -4,7 +4,7 @@ This project uses AI assistance for both runtime pipeline logic (Claude as the o
 
 | Tool | Purpose | Version |
 |---|---|---|
-| Claude `claude-sonnet-4-6` (Anthropic API) | Runtime: agent orchestration via the `tool_use` API; reasons over `fetch_tcc`, `fetch_elevation`, `compute_risk_score` per batch and flags anomalies. | `claude-sonnet-4-6` |
+| Claude `claude-sonnet-4-6` (Anthropic API) | Runtime: pipeline orchestration via the `tool_use` API. **One** API call per run, five pipeline-level tools (`ingest_locations`, `sample_environment`, `score_risk`, `validate_results`, `generate_report`). Reasons about each step's summary (data quality, missing-data rates, tier distribution, validation anomalies), decides whether to proceed, and writes the plain-English end-of-run summary. Per-location reasoning is preserved in `run_interactive` for single-coordinate queries. | `claude-sonnet-4-6` |
 | Cursor | Development: IDE with AI assistance for code generation, refactoring, and documentation drafting under explicit prompts and human review. | latest |
 
 ## Cases where I diverged from AI output
@@ -80,6 +80,30 @@ The two entries below are cases where Cursor's generated code deviated from the 
 6. `score_components` accepts a `latitude` keyword argument that the v3.0 formula ignores, because Phase 7's Claude tool schema declares latitude as a required input for forward compatibility with hemisphere-aware scoring (south-facing CONUS dishes need slope/aspect orientation context) and the agent and Claude tool surfaces must match.
 7. The three bucket-output scores are named `_SCORE_HIGH / _SCORE_MODERATE / _SCORE_LOW` even though they're just `1.0 / 0.5 / 0.0`, because (a) naming the buckets disambiguates them from the configurable weights in the source (otherwise `0.5` could mean either `TCC_WEIGHT` or the moderate bucket) and (b) it lets the regression test `test_no_hardcoded_thresholds_in_scoring_module` scan the executable code for accidental weight literals without false-positives on the bucket values.
 8. `ScoredLocation.all_flags` is order-preserved-deduplicated with env flags BEFORE scoring flags, because a reviewer reading the flag list cares first about what the upstream data-quality state was (env_fetch_flags) and only then about what the scoring engine itself flagged — and `set()` + sorting would scramble that storyline.
+
+## Phase 7 — Claude Orchestrator architectural redesign
+
+Before implementing Phase 7 I changed the agent design that was in the build plan. The change is large enough to warrant its own section.
+
+**Original design (replaced):** Claude reasons per batch of ~100 locations, calling `fetch_tcc`, `fetch_elevation`, and `compute_risk_score` once per row. At 4.67M rows that would mean ~46,700 Claude calls and roughly $10,600 in API spend, which is incompatible with running the full North Carolina dataset that ships in `data/locations.csv`.
+
+**New design (implemented):** Claude makes ONE API call per pipeline run. It is given five pipeline-level tools — `ingest_locations`, `sample_environment`, `score_risk`, `validate_results`, `generate_report` — and each tool internally runs the full dataset through the existing Phase 1-6 agents (none of `ingestion.py`, `environmental.py`, `scoring.py`, `tcc.py`, `elevation.py`, or `landcover.py` was modified). Claude reasons about each step's summary (valid_pct, missing-data rates, tier distribution, validation anomalies), decides whether to proceed, and writes the plain-English end-of-run summary. Total cost: under $1 for the full 4.67M-row dataset.
+
+Decisions tied to the redesign:
+
+1. **Per-location Claude reasoning is preserved in interactive mode only.** `PipelineOrchestrator.run_interactive(lat, lon)` is the one path where Claude sees an individual location — it costs ~$0.01 per query and demonstrates the "user gives coordinates, agent explains sky visibility" agentic scenario from the challenge brief at a cost shape that makes sense for one-off queries. Applying that same per-location call pattern at 4.67M rows is what the redesign is replacing.
+
+2. **The five tools each persist their output to parquet** (`data/processed/validated_locations.parquet`, `enriched_locations.parquet`, `scored_locations.parquet`). The next tool reads the previous tool's parquet, so Claude only ever sees JSON summaries — never individual rows. That is the whole point: Claude's reasoning lives at the level where it can move the needle (data quality calls, anomaly flagging, distribution sanity checks), and the per-row work stays in deterministic Python.
+
+3. **Four validation checks fire between scoring and reporting**: distribution sanity (>80% in any one tier flags a threshold calibration issue), cross-validation (forest-classified pixels with `tcc_pct < 10` flagged as likely clear-cut / data-vintage mismatch), geographic sanity (rows outside the NC bounding box halt the pipeline), and missing-data rate (any single signal >15% missing flags as a warning). Geographic-sanity failure is the only check that halts the pipeline; the other three degrade status to "warnings" and surface in the report.
+
+4. **`MAX_AGENT_TURNS = 20` bounds the tool call loop.** If Claude never returns `end_turn`, the loop exits cleanly with a `MAX_TURNS_REACHED` log event rather than spinning forever. The cap is intentionally generous — at five real tool calls plus a few clarification turns the budget is far below 20 — so a healthy run never hits it but a pathological prompt-injection scenario can't run the bill up.
+
+5. **`CLAUDE_BATCH_SIZE` was removed from `src/config.py`** because the new design no longer reasons per batch of locations. The legacy `IngestionAgent.run()` default-fallback path that referenced it is unused — the orchestrator always passes `batch_size=config.RASTER_BATCH_SIZE` explicitly — but per Phase 7's "do not touch ingestion.py" guidance the docstring in `ingestion.py` was left stale and the contract is documented in this file instead.
+
+6. **System prompt versioned at `src/agents/prompts/orchestrator_v1.txt`** rather than hardcoded in Python, so prompt revisions are reviewable in git diffs and the prompt artifact is auditable separately from the loader.
+
+7. **Cost projection is documented in `src/config.py`** alongside the agent config block so a reviewer reading the constants sees the redesign's economic basis without having to dig through this file.
 
 ## Phase 4 follow-up — geoid_cb derivation
 
