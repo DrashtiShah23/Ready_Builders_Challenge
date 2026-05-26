@@ -132,3 +132,24 @@ LANDCOVER_RASTER_URL: str = (
 
 # --- CSV ingestion contract ---
 EXPECTED_CSV_COLUMNS: list[str] = ["location_id", "latitude", "longitude", "state", "county"]
+
+# --- CONUS state -> FIPS code lookup ---
+# Used by src/data/downloader.py:download_dem_tiles to query the USGS National Map
+# API (https://tnmaccess.nationalmap.gov) with polyType=state&polyCode=<FIPS> for
+# per-state DEM tile filtering. CONUS only — AK / HI / territories excluded
+# because Starlink coverage commitments and the install guide target the lower 48.
+STATE_FIPS: dict[str, str] = {
+    "AL": "01", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09",
+    "DE": "10", "DC": "11", "FL": "12", "GA": "13", "ID": "16", "IL": "17",
+    "IN": "18", "IA": "19", "KS": "20", "KY": "21", "LA": "22", "ME": "23",
+    "MD": "24", "MA": "25", "MI": "26", "MN": "27", "MS": "28", "MO": "29",
+    "MT": "30", "NE": "31", "NV": "32", "NH": "33", "NJ": "34", "NM": "35",
+    "NY": "36", "NC": "37", "ND": "38", "OH": "39", "OK": "40", "OR": "41",
+    "PA": "42", "RI": "44", "SC": "45", "SD": "46", "TN": "47", "TX": "48",
+    "UT": "49", "VT": "50", "VA": "51", "WA": "53", "WV": "54", "WI": "55",
+    "WY": "56",
+}
+
+# --- USGS National Map endpoints (versioned for reproducibility) ---
+TNM_API_BASE: str = "https://tnmaccess.nationalmap.gov/api/v1/products"
+TNM_DEM_DATASET: str = "National Elevation Dataset (NED) 1 arc-second"
