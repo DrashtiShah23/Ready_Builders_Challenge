@@ -673,6 +673,221 @@ class TestCoercion:
 
 
 # ===========================================================================
+# Phase 8: --states filter, --resume short-circuit, PIPELINE_CHECKPOINT events
+# ===========================================================================
+
+
+def _write_locations_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+class TestStatesFilter:
+    def test_states_filter_drops_non_matching_rows(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``states`` is set on the orchestrator, ingestion must drop
+        every row whose state is not in the allowlist."""
+        csv = _write_locations_csv(
+            tmp_path / "locs.csv",
+            [
+                {"location_id": "NC1", "latitude": 35.5, "longitude": -80.0, "state": "NC"},
+                {"location_id": "NC2", "latitude": 35.6, "longitude": -80.1, "state": "NC"},
+                {"location_id": "CA1", "latitude": 37.0, "longitude": -120.0, "state": "CA"},
+                {"location_id": "TX1", "latitude": 30.0, "longitude": -97.0, "state": "TX"},
+            ],
+        )
+        monkeypatch.setattr(orch_mod, "_VALIDATED_PARQUET", tmp_path / "v.parquet")
+        monkeypatch.setattr(orch_mod, "_PROCESSED_DIR", tmp_path)
+
+        orch._states_filter = {"NC"}
+        result = orch._run_ingest_locations(str(csv))
+
+        assert result["valid_rows"] == 2
+        assert set(result["state_distribution"].keys()) == {"NC"}
+
+    def test_states_filter_case_normalised_in_run(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``run(..., states=["nc"])`` must normalise to upper-case so the
+        filter matches the canonical state column."""
+        # We don't need to drive the Claude loop here — just verify the
+        # filter is populated correctly when ``run`` initialises it.
+        orch.client.messages.create = MagicMock(
+            return_value=_response("end_turn", [_text_block("done")])
+        )
+        orch.run("ignored.csv", sample_size=None, states=["nc", "ca"])
+        assert orch._states_filter == {"NC", "CA"}
+
+
+class TestResumeShortCircuit:
+    def test_resume_skips_ingest_when_validated_parquet_exists(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        logger: _CaptureLogger,
+    ) -> None:
+        """With ``resume=True`` and a pre-existing validated parquet, the
+        ingest handler returns a summary from disk without re-running
+        ``IngestionAgent.run``."""
+        validated_path = tmp_path / "v.parquet"
+        pd.DataFrame(
+            [
+                {
+                    "location_id": f"L{i}",
+                    "latitude": 35.5,
+                    "longitude": -80.0,
+                    "state": "NC",
+                    "county": "37001",
+                    "batch_id": "batch-000000",
+                }
+                for i in range(3)
+            ]
+        ).to_parquet(validated_path, index=False)
+        monkeypatch.setattr(orch_mod, "_VALIDATED_PARQUET", validated_path)
+        orch._resume = True
+
+        # ``IngestionAgent.run`` must NOT be invoked.
+        with patch.object(
+            orch_mod, "IngestionAgent"
+        ) as ingestion_cls:
+            result = orch._run_ingest_locations("doesnt-matter.csv")
+            ingestion_cls.assert_not_called()
+
+        assert result["status"] == "ok"
+        assert result["valid_rows"] == 3
+        assert "RESUME" in result["notes"]
+        # A RESUME_SKIP event is logged for this step.
+        assert any(
+            e["event_type"] == "RESUME_SKIP"
+            and e["detail"]["step"] == "ingest_locations"
+            for e in logger.events
+        )
+
+    def test_resume_does_not_skip_when_parquet_missing(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Resume only skips the step when the artifact actually exists."""
+        csv = _write_locations_csv(
+            tmp_path / "locs.csv",
+            [
+                {"location_id": "L1", "latitude": 35.5, "longitude": -80.0, "state": "NC"},
+            ],
+        )
+        monkeypatch.setattr(orch_mod, "_VALIDATED_PARQUET", tmp_path / "missing.parquet")
+        monkeypatch.setattr(orch_mod, "_PROCESSED_DIR", tmp_path)
+        orch._resume = True
+
+        result = orch._run_ingest_locations(str(csv))
+        # Real ingestion ran — total_rows reflects the input CSV, not a
+        # synthetic RESUME summary.
+        assert "RESUME" not in result["notes"]
+        assert result["total_rows"] == 1
+
+
+class TestPipelineCheckpoint:
+    def test_checkpoint_logged_after_ingest(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        logger: _CaptureLogger,
+    ) -> None:
+        """``_run_ingest_locations`` must emit a PIPELINE_CHECKPOINT after
+        writing the validated parquet. Phase 11's metrics module scans
+        for these event names."""
+        csv = _write_locations_csv(
+            tmp_path / "locs.csv",
+            [
+                {"location_id": "L1", "latitude": 35.5, "longitude": -80.0, "state": "NC"},
+            ],
+        )
+        monkeypatch.setattr(orch_mod, "_VALIDATED_PARQUET", tmp_path / "v.parquet")
+        monkeypatch.setattr(orch_mod, "_PROCESSED_DIR", tmp_path)
+
+        orch._run_ingest_locations(str(csv))
+
+        checkpoints = [
+            e for e in logger.events if e["event_type"] == "PIPELINE_CHECKPOINT"
+        ]
+        assert len(checkpoints) >= 1
+        cp = checkpoints[-1]["detail"]
+        assert cp["step"] == "ingest_locations"
+        assert cp["row_count"] == 1
+        assert cp["resume_eligible"] is True
+
+
+class TestPartitionedStoreWrite:
+    def test_score_risk_writes_partitioned_store(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_run_score_risk`` must populate the Hive-partitioned store in
+        addition to the single-file intermediate."""
+        enriched_path = tmp_path / "enriched.parquet"
+        pd.DataFrame(
+            [
+                {
+                    "location_id": f"L{i}",
+                    "latitude": 35.5,
+                    "longitude": -80.0,
+                    "state": "NC",
+                    "county": "37001",
+                    "tcc_pct": 60,
+                    "elevation_m": 200.0,
+                    "slope_deg": 5.0,
+                    "aspect_deg": 180.0,
+                    "land_cover_code": 42,
+                    "land_cover_class": "Evergreen Forest",
+                    "env_fetch_flags": [],
+                    "batch_id": "batch-000000",
+                }
+                for i in range(3)
+            ]
+        ).to_parquet(enriched_path, index=False)
+
+        scored_dir = tmp_path / "scored_store"
+        scored_dir.mkdir()
+        monkeypatch.setattr(orch_mod, "_SCORED_PARQUET", tmp_path / "scored.parquet")
+        monkeypatch.setattr(orch_mod.config, "SCORED_DIR", scored_dir)
+
+        result = orch._run_score_risk(str(enriched_path))
+        assert result["status"] == "ok"
+        assert (scored_dir / "state=NC").is_dir()
+        # And the single-file intermediate exists at the patched path.
+        assert (tmp_path / "scored.parquet").exists()
+
+
+class TestRunPropagatesStatesAndResume:
+    def test_run_threads_states_and_resume_into_instance_state(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        orch.client.messages.create = MagicMock(
+            return_value=_response("end_turn", [_text_block("done")])
+        )
+        orch.run(
+            "ignored.csv",
+            sample_size=None,
+            states=["NC"],
+            resume=True,
+        )
+        assert orch._states_filter == {"NC"}
+        assert orch._resume is True
+
+
+# ===========================================================================
 # Cost-estimate logging (one COST_ESTIMATE event per Claude response)
 # ===========================================================================
 

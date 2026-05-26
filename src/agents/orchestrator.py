@@ -62,6 +62,7 @@ from src.agents.scoring import (
     TIER_UNSCORED,
     score_components,
 )
+from src.data import store
 from src.schemas.location import ValidatedLocation
 from src.tools.elevation import fetch_elevation
 from src.tools.landcover import fetch_land_cover
@@ -291,6 +292,14 @@ class PipelineOrchestrator:
         # state.
         self._default_sample_size: Optional[int] = None
 
+        # Per-run options that are *not* part of any tool's input schema —
+        # Claude doesn't need to know about them, but the handlers do.
+        # ``_resume`` makes each ``_run_*`` skip its body when its output
+        # parquet already exists. ``_states_filter`` restricts ingestion
+        # to a subset of state abbreviations (Phase 8 ``--states`` flag).
+        self._resume: bool = False
+        self._states_filter: Optional[set[str]] = None
+
         # Optional callbacks for callers that want real-time visibility into
         # tool dispatch (e.g. pipeline.py prints `>>> Running ...` / `<<< ...
         # complete`). Defaults to no-op so unit tests and library callers
@@ -313,7 +322,13 @@ class PipelineOrchestrator:
     # Public entry points
     # ------------------------------------------------------------------
 
-    def run(self, csv_path: str, sample_size: Optional[int] = None) -> dict[str, Any]:
+    def run(
+        self,
+        csv_path: str,
+        sample_size: Optional[int] = None,
+        states: Optional[list[str]] = None,
+        resume: bool = False,
+    ) -> dict[str, Any]:
         """Run the full five-step pipeline.
 
         Sends ONE message to Claude with the task; Claude calls the five
@@ -321,17 +336,43 @@ class PipelineOrchestrator:
         ``end_turn`` (after its final summary) or when the safety cap
         ``MAX_AGENT_TURNS`` is hit.
 
+        Parameters
+        ----------
+        csv_path:
+            Path to the input locations CSV.
+        sample_size:
+            If set, ingestion sub-samples to this many valid rows before
+            enrichment runs.
+        states:
+            If set, ingestion drops every row whose ``state`` is not in
+            this list (case-insensitive). Equivalent to the Phase 8
+            ``--states`` CLI flag.
+        resume:
+            If True, each tool short-circuits when its output parquet
+            already exists, returning a "skipped" summary. Use to recover
+            from a crashed run without re-paying the enrichment cost.
+
         Returns a dict with the final summary text, the tool-call trace,
         and token-usage totals so callers can audit cost and behavior.
         """
         self._default_sample_size = sample_size
+        self._states_filter = (
+            {s.upper() for s in states} if states else None
+        )
+        self._resume = resume
         run_start = time.monotonic()
 
+        resume_note = " (resume mode — completed steps will be skipped)" if resume else ""
+        states_note = (
+            f"\nFilter to states: {sorted(self._states_filter)}."
+            if self._states_filter
+            else ""
+        )
         initial_message = (
             f"Run the full LEO satellite coverage risk pipeline on the locations "
-            f"CSV at: {csv_path}\n\n"
+            f"CSV at: {csv_path}{resume_note}.\n\n"
             f"Sample size for this run: "
-            f"{'full dataset' if sample_size is None else sample_size}.\n\n"
+            f"{'full dataset' if sample_size is None else sample_size}.{states_note}\n\n"
             "Call the five tools in order. After each tool, reason about whether "
             "to continue. After generate_report, write a plain-English summary."
         )
@@ -681,6 +722,12 @@ class PipelineOrchestrator:
     def _run_ingest_locations(
         self, file_path: str, sample_size: Optional[int] = None
     ) -> dict[str, Any]:
+        # Resume short-circuit: if the validated parquet exists, return a
+        # summary from it without re-running ingestion. The downstream tools
+        # never know the difference because the on-disk artifact is the same.
+        if self._resume and _VALIDATED_PARQUET.exists():
+            return self._resume_ingest_summary()
+
         # If Claude doesn't supply sample_size, fall back to whatever the
         # caller passed to ``run()``.
         if sample_size is None:
@@ -700,6 +747,12 @@ class PipelineOrchestrator:
 
         validated: list[ValidatedLocation] = []
         for batch in agent.run(csv_path, batch_size=ingest_batch_size):
+            # ``states`` filter: drop rows whose canonical state isn't in
+            # the allowlist before deciding the sample budget is full. The
+            # filter is applied here (not in IngestionAgent) so Phase 4's
+            # tested ingestion logic stays unmodified.
+            if self._states_filter is not None:
+                batch = [v for v in batch if v.state in self._states_filter]
             validated.extend(batch)
             # Early-exit when sampling: ``agent.run`` is a generator, so
             # abandoning iteration here saves reading the remaining ~4.67M
@@ -726,6 +779,7 @@ class PipelineOrchestrator:
 
         _PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         df.to_parquet(_VALIDATED_PARQUET, index=False)
+        self._log_checkpoint("ingest_locations", str(_VALIDATED_PARQUET), len(df))
 
         # Build a complete drop breakdown — every Reason is present (with 0
         # when nothing was dropped for that reason) so Claude can read a
@@ -777,6 +831,9 @@ class PipelineOrchestrator:
     def _run_sample_environment(
         self, validated_locations_path: str
     ) -> dict[str, Any]:
+        if self._resume and _ENRICHED_PARQUET.exists():
+            return self._resume_enrich_summary()
+
         df = pd.read_parquet(validated_locations_path)
         total_locations = len(df)
         if total_locations == 0:
@@ -831,6 +888,9 @@ class PipelineOrchestrator:
         agent.log_run_summary()
         out_df = pd.DataFrame(enriched_rows)
         out_df.to_parquet(_ENRICHED_PARQUET, index=False)
+        self._log_checkpoint(
+            "sample_environment", str(_ENRICHED_PARQUET), len(out_df)
+        )
 
         # A row is "enriched" if at least one of the three scoring signals
         # came back present. A row with every signal null is unscorable
@@ -902,6 +962,9 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
 
     def _run_score_risk(self, enriched_locations_path: str) -> dict[str, Any]:
+        if self._resume and _SCORED_PARQUET.exists():
+            return self._resume_score_summary()
+
         df = pd.read_parquet(enriched_locations_path)
         total = len(df)
         if total == 0:
@@ -975,6 +1038,12 @@ class PipelineOrchestrator:
 
         scored_df = pd.DataFrame(records)
         scored_df.to_parquet(_SCORED_PARQUET, index=False)
+        # Write the queryable Hive-partitioned store as well. The downstream
+        # tools still read the single-file intermediate (no behavioural change
+        # for them), but the report generator and ``pipeline.py --resume``
+        # consult the partition store via DuckDB.
+        store.write_scored_locations(scored_df, scored_dir=config.SCORED_DIR)
+        self._log_checkpoint("score_risk", str(_SCORED_PARQUET), len(scored_df))
 
         tier_counts = scored_df["risk_tier"].value_counts().to_dict()
         all_tiers = [TIER_LOW, TIER_MODERATE, TIER_HIGH, TIER_UNSCORED]
@@ -1426,6 +1495,134 @@ class PipelineOrchestrator:
                 "estimated_cost_usd": round(cost_usd, 6),
             },
         )
+
+    def _log_checkpoint(
+        self, step: str, output_path: str, row_count: int
+    ) -> None:
+        """Emit a ``PIPELINE_CHECKPOINT`` event after a tool persists output.
+
+        The structured-log JSONL is the canonical audit trail for what each
+        run produced. ``PIPELINE_CHECKPOINT`` events are what Phase 11's
+        metrics module scans for to compute per-step latency and to detect
+        crashed runs (a checkpoint for step N but not N+1).
+        """
+        self.logger.info(
+            stage="orchestrator",
+            event_type="PIPELINE_CHECKPOINT",
+            detail={
+                "step": step,
+                "output_path": output_path,
+                "row_count": int(row_count),
+                "resume_eligible": True,
+            },
+        )
+
+    def _resume_ingest_summary(self) -> dict[str, Any]:
+        """Build a synthetic ``ingest_locations`` summary from the on-disk
+        validated parquet. Called when ``--resume`` finds the artifact
+        already present, so the real ingestion work is skipped.
+        """
+        df = pd.read_parquet(_VALIDATED_PARQUET)
+        state_distribution = (
+            {str(k): int(v) for k, v in df["state"].dropna().value_counts().items()}
+            if "state" in df.columns
+            else {}
+        )
+        self.logger.info(
+            stage="orchestrator",
+            event_type="RESUME_SKIP",
+            detail={"step": "ingest_locations", "rows": len(df)},
+        )
+        return {
+            "status": "ok",
+            "total_rows": int(len(df)),
+            "valid_rows": int(len(df)),
+            "dropped_rows": 0,
+            "valid_pct": 1.0,
+            "drop_breakdown": {
+                Reason.NULL_LOCATION_ID: 0,
+                Reason.NULL_COORDINATE: 0,
+                Reason.OUT_OF_BOUNDS: 0,
+                Reason.INVALID_STATE: 0,
+                Reason.DUPLICATE_DROPPED: 0,
+                Reason.PARSE_ERROR: 0,
+            },
+            "state_distribution": state_distribution,
+            "output_path": str(_VALIDATED_PARQUET),
+            "critical_failure": False,
+            "notes": "RESUME: reused existing validated_locations.parquet.",
+        }
+
+    def _resume_enrich_summary(self) -> dict[str, Any]:
+        """Build a synthetic ``sample_environment`` summary from the on-disk
+        enriched parquet. Recomputes missing rates so Claude's downstream
+        reasoning still has accurate data-quality numbers."""
+        df = pd.read_parquet(_ENRICHED_PARQUET)
+        total = len(df)
+        self.logger.info(
+            stage="orchestrator",
+            event_type="RESUME_SKIP",
+            detail={"step": "sample_environment", "rows": total},
+        )
+
+        def _missing_pct(col: str) -> float:
+            return round(df[col].isna().sum() / total, 4) if total else 0.0
+
+        missing_rates = {
+            "tcc_missing_pct": _missing_pct("tcc_pct"),
+            "elevation_missing_pct": _missing_pct("elevation_m"),
+            "slope_missing_pct": _missing_pct("slope_deg"),
+            "landcover_missing_pct": _missing_pct("land_cover_code"),
+        }
+        return {
+            "status": "ok",
+            "total_locations": int(total),
+            "enriched_locations": int(total),
+            "missing_rates": missing_rates,
+            "output_path": str(_ENRICHED_PARQUET),
+            "raster_files_used": {},
+            "notes": "RESUME: reused existing enriched_locations.parquet.",
+        }
+
+    def _resume_score_summary(self) -> dict[str, Any]:
+        """Build a synthetic ``score_risk`` summary from the on-disk
+        scored parquet. Recomputes the tier distribution + dominant flag
+        so the validation step's downstream reasoning still works."""
+        df = pd.read_parquet(_SCORED_PARQUET)
+        total = len(df)
+        self.logger.info(
+            stage="orchestrator",
+            event_type="RESUME_SKIP",
+            detail={"step": "score_risk", "rows": total},
+        )
+
+        tier_counts = df["risk_tier"].value_counts().to_dict() if total else {}
+        tier_distribution: dict[str, dict[str, Any]] = {}
+        dominant_tier_flag = False
+        for tier in (TIER_LOW, TIER_MODERATE, TIER_HIGH, TIER_UNSCORED):
+            count = int(tier_counts.get(tier, 0))
+            pct = round(count / total, 4) if total else 0.0
+            tier_distribution[tier] = {"count": count, "pct": pct}
+            if tier != TIER_UNSCORED and pct > _DOMINANT_TIER_THRESHOLD:
+                dominant_tier_flag = True
+
+        unscored = int(tier_counts.get(TIER_UNSCORED, 0))
+        scored = total - unscored
+        mean_score = (
+            round(float(df["risk_score"].dropna().mean()), 4)
+            if scored
+            else None
+        )
+        return {
+            "status": "ok",
+            "total_scored": int(scored),
+            "unscored": unscored,
+            "tier_distribution": tier_distribution,
+            "mean_composite_score": mean_score,
+            "output_path": str(_SCORED_PARQUET),
+            "dominant_tier_flag": dominant_tier_flag,
+            "notes": "RESUME: reused existing scored_locations.parquet.",
+        }
 
 
 # ---------------------------------------------------------------------------

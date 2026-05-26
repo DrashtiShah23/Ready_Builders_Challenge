@@ -105,6 +105,30 @@ Decisions tied to the redesign:
 
 7. **Cost projection is documented in `src/config.py`** alongside the agent config block so a reviewer reading the constants sees the redesign's economic basis without having to dig through this file.
 
+## Phase 8 — State store and pipeline runner
+
+Phase 8 was reinterpreted under the Phase 7 redesign — the original per-batch checkpoint loop no longer exists, so the deliverables had to be re-shaped while preserving the spirit (state store, DuckDB analytics, resumability, `--states` filter, clean shutdown).
+
+1. **Partitioned state store at `outputs/scored/state={STATE}/part-0.parquet`** is the canonical analytics surface, but the orchestrator continues to write a single-file intermediate at `data/processed/scored_locations.parquet` because the downstream validate/report tools read it directly. Both writes happen in `_run_score_risk` — the duplication is cheap (one extra parquet write per run) and avoids forcing the downstream tools to use DuckDB / partition globs just to load the data they already had in memory upstream.
+
+2. **DuckDB queries always use an explicit `state=*/*.parquet` glob** rather than a directory scan. Sibling summary parquets (`risk_summary_by_state.parquet`, `risk_summary_by_county.parquet`) live at the same `outputs/scored/` root, and any reader that does `pd.read_parquet(dir)` would silently include them as part of the partitioned dataset. The glob form was tested explicitly (`tests/test_store.py::TestReader::test_sibling_summary_parquets_are_ignored`) because this was a real bug we hit during implementation.
+
+3. **`--resume` works at the parquet-step level, not per-batch.** The original Phase 8 spec called for per-batch checkpoints; the redesigned Phase 7 has no per-batch loop to checkpoint between. Instead, each `_run_*` method checks if its output parquet already exists at the start of the call and returns a synthetic "RESUME" summary built from that parquet if so. Claude sees the summary, reasons about it, and moves on to the next tool. A pipeline that crashed during enrichment can be restarted with `--resume` and skip the hours of raster work it had already completed.
+
+4. **`--states` filter is applied post-validation, not inside `IngestionAgent`.** Phase 4's tested ingestion logic is in the "do not touch" set; threading the filter into `IngestionAgent.run` would have meant a Phase 4 contract change. Instead the orchestrator drops the non-matching rows from each yielded batch before extending the running list. Functionally identical, surface-stable for ingestion.
+
+5. **`PIPELINE_CHECKPOINT` events fire after each parquet write.** A stable event name (rather than re-purposing `TOOL_CALL`) gives Phase 11's metrics module a single thing to scan for to compute per-step latency and to detect crashed runs (a checkpoint for step N but not step N+1). The events also carry `resume_eligible: true` so a future smarter resume logic can distinguish "this artifact is safe to reuse" from "this artifact was abandoned".
+
+6. **`--mode {batch,interactive,dry-run}` is now the canonical mode selector.** The legacy `--interactive` and `--dry-run` booleans from Phase 7 still work as aliases (the legacy switches win over `--mode` when both are set, mirroring the Phase 7 behaviour). This keeps Phase 7 documentation and any in-flight tooling unbroken while giving Phase 8+ docs a single coherent flag.
+
+7. **Ctrl+C handling is at the top of `main()`, not inside the orchestrator.** A `SIGINT` handler is installed before any work starts; it emits a `PIPELINE_INTERRUPTED` event and re-raises `KeyboardInterrupt`, which the top-level `try/except` in `main()` converts to exit code 130 (POSIX convention: 128 + SIGINT). The orchestrator never has to know about signals — keeps its surface narrow and makes it trivially unit-testable.
+
+8. **Null-state rows go to `state=UNKNOWN/`** in the partition store rather than being dropped. Phase 4 only emits `state=None` when geoid_cb derivation explicitly failed, so surfacing that population as its own partition is part of the data-quality story rather than something to hide.
+
+9. **`get_top_at_risk_counties(min_locations=25)` has a default size floor** to suppress statistically meaningless county-level pcts. One High row out of two locations is not a "high-risk county"; 25 is small enough to keep most real rural counties and large enough to drop the noise. The parameter is exposed so callers with denser samples can lower it.
+
+10. **`pyarrow` was added as an explicit dependency** even though pandas pulls it transitively when writing parquet. The store writer passes `engine="pyarrow"` explicitly to ensure deterministic behaviour across pandas builds (some default to `fastparquet`, which doesn't fully support all the dtype round-trips we rely on).
+
 ## Phase 4 follow-up — geoid_cb derivation
 
 1. The real locations.csv (handed over after Phase 6) carries a `geoid_cb` column instead of separate `state` / `county` columns, so ingestion now derives state abbreviation and county GEOID from the first 5 digits of the 15-digit Census Block GEOID — pure data-already-present extraction, no extra column to ask the user for.
