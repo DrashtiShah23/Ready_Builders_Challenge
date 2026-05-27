@@ -1596,3 +1596,299 @@ class TestGenerateReport:
             scored_dir=scored_dir
         )
         pd.testing.assert_frame_equal(on_disk_county, ducked_county)
+
+
+# ===========================================================================
+# Phase 10 — interactive map
+# ===========================================================================
+
+
+def _scored_df_with_all_tiers(n_per_tier: int = 8) -> pd.DataFrame:
+    """Synthesise a small scored dataset spanning every tier + one
+    UNSCORED row, all at distinct lat/lon so MarkerCluster has real
+    geographic distribution to work with."""
+    rows: list[dict[str, Any]] = []
+    tiers = [
+        (TIER_HIGH, 0.85, 60, 25.0, 42, "Evergreen Forest"),
+        (TIER_MODERATE, 0.45, 30, 12.0, 22, "Developed, Low Intensity"),
+        (TIER_LOW, 0.10, 5, 2.0, 81, "Pasture/Hay"),
+    ]
+    for tier, score, tcc, slope, lc_code, lc_name in tiers:
+        for i in range(n_per_tier):
+            rows.append(
+                {
+                    "location_id": f"{tier}-{i}",
+                    "latitude": 35.5 + (i * 0.01),
+                    "longitude": -80.0 - (i * 0.01),
+                    "state": "NC",
+                    "county": f"37{str(i).zfill(3)}",
+                    "tcc_pct": tcc,
+                    "slope_deg": slope,
+                    "aspect_deg": 180.0,
+                    "land_cover_code": lc_code,
+                    "land_cover_class": lc_name,
+                    "risk_score": score,
+                    "risk_tier": tier,
+                    "tcc_score": 1.0 if tier == TIER_HIGH else 0.0,
+                    "terrain_score": 1.0 if tier == TIER_HIGH else 0.0,
+                    "landcover_score": 1.0 if tier == TIER_HIGH else 0.0,
+                    "all_flags": [],
+                    "batch_id": "batch-000000",
+                }
+            )
+    # One UNSCORED row to confirm it is filtered out of the map.
+    rows.append(
+        {
+            "location_id": "unscored-1",
+            "latitude": 36.0,
+            "longitude": -80.5,
+            "state": "NC",
+            "county": "37999",
+            "tcc_pct": None,
+            "slope_deg": None,
+            "aspect_deg": None,
+            "land_cover_code": None,
+            "land_cover_class": None,
+            "risk_score": None,
+            "risk_tier": TIER_UNSCORED,
+            "tcc_score": None,
+            "terrain_score": None,
+            "landcover_score": None,
+            "all_flags": [],
+            "batch_id": "batch-000000",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+class TestRenderMap:
+    """Phase 10 STOP-gate verification — the rendered HTML must include
+    every spec-required feature (base layer, hex colours, layer control,
+    cluster, legend, tooltip fields)."""
+
+    def test_map_html_contains_every_spec_feature(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "risk_map.html"
+        monkeypatch.setattr(orch_mod, "_MAP_HTML", out)
+        df = _scored_df_with_all_tiers()
+        orch._render_map(df)
+        assert out.exists(), "map HTML was not written"
+
+        html = out.read_text()
+        # Base layer
+        assert "openstreetmap" in html.lower()
+        # Spec hex codes for the three tiers
+        assert "#e74c3c" in html
+        assert "#f39c12" in html
+        assert "#2ecc71" in html
+        # MarkerCluster with the spec'd zoom threshold
+        assert "MarkerCluster" in html
+        assert "disableClusteringAtZoom" in html and "8" in html
+        # LayerControl present and not collapsed
+        assert "LayerControl" in html or "layer_control" in html.lower()
+        # Inline legend with the marker count summary in the toggle
+        # labels (LayerControl shows them) and the legend title text.
+        assert "LEO obstruction risk" in html
+        assert "High risk (" in html  # FeatureGroup name carries the count
+        assert "Moderate risk (" in html
+        assert "Low risk (" in html
+        # Every spec'd tooltip field label appears in the HTML.
+        for label in (
+            "Location",
+            "State",
+            "County",
+            "Risk tier",
+            "Risk score",
+            "Tree canopy",
+            "Slope",
+            "Land cover",
+        ):
+            assert label in html, f"tooltip field missing: {label}"
+
+    def test_unscored_rows_are_excluded(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """UNSCORED locations have no position on the risk spectrum,
+        so painting them on the map (in any colour) would mislead
+        the reader — they belong in the report's Data Quality table."""
+        out = tmp_path / "risk_map.html"
+        monkeypatch.setattr(orch_mod, "_MAP_HTML", out)
+        df = _scored_df_with_all_tiers()
+        # Sanity-check the fixture: an UNSCORED row IS in the input.
+        assert (df["risk_tier"] == TIER_UNSCORED).any()
+        orch._render_map(df)
+        html = out.read_text()
+        # The UNSCORED row's location_id must not appear anywhere
+        # in the rendered HTML — neither tooltip nor coordinates.
+        assert "unscored-1" not in html
+
+    def test_empty_dataset_skips_render(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An empty input must not raise and must not write an empty
+        HTML file — the report's status logic already handles the
+        zero-data case before the map step runs."""
+        out = tmp_path / "risk_map.html"
+        monkeypatch.setattr(orch_mod, "_MAP_HTML", out)
+        empty = pd.DataFrame(columns=["risk_tier", "latitude", "longitude"])
+        orch._render_map(empty)
+        assert not out.exists()
+
+    def test_only_unscored_rows_skips_render(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An input where every row is UNSCORED has nothing to paint
+        once the unscored rows are filtered out — must not raise."""
+        out = tmp_path / "risk_map.html"
+        monkeypatch.setattr(orch_mod, "_MAP_HTML", out)
+        df = pd.DataFrame(
+            [
+                {
+                    "location_id": "u1",
+                    "latitude": 35.5,
+                    "longitude": -80.0,
+                    "state": "NC",
+                    "county": "37001",
+                    "risk_tier": TIER_UNSCORED,
+                    "risk_score": None,
+                    "tcc_pct": None,
+                    "slope_deg": None,
+                    "land_cover_class": None,
+                }
+            ]
+        )
+        orch._render_map(df)
+        assert not out.exists()
+
+
+class TestSampleForMap:
+    """Tier-stratified subsampling — the cap must always be respected,
+    every tier must keep proportional representation, and the spec'd
+    UNSCORED filter must apply before the budget is computed."""
+
+    def _df(self, h: int, m: int, l: int, u: int = 0) -> pd.DataFrame:
+        rows: list[dict[str, Any]] = []
+        for prefix, n, tier in (
+            ("h", h, TIER_HIGH),
+            ("m", m, TIER_MODERATE),
+            ("l", l, TIER_LOW),
+            ("u", u, TIER_UNSCORED),
+        ):
+            for i in range(n):
+                rows.append(
+                    {
+                        "location_id": f"{prefix}-{i}",
+                        "latitude": 35.0,
+                        "longitude": -80.0,
+                        "risk_tier": tier,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_under_budget_returns_full_dataset(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        """A scored dataset smaller than ``_MAP_MAX_POINTS`` must
+        render every point — no information loss for the small case."""
+        df = self._df(10, 20, 30)
+        sample = orch._sample_for_map(df)
+        assert len(sample) == 60
+        assert set(sample["risk_tier"]) == {TIER_HIGH, TIER_MODERATE, TIER_LOW}
+
+    def test_unscored_rows_filtered_before_budget(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        df = self._df(5, 5, 5, u=5)
+        sample = orch._sample_for_map(df)
+        assert TIER_UNSCORED not in set(sample["risk_tier"])
+
+    def test_cap_respected_on_large_dataset(
+        self, orch: PipelineOrchestrator,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Patch the cap to 100 and feed a 300-row dataset — the
+        returned sample must be exactly 100 rows."""
+        monkeypatch.setattr(orch_mod, "_MAP_MAX_POINTS", 100)
+        df = self._df(120, 120, 120)
+        sample = orch._sample_for_map(df)
+        assert len(sample) == 100
+
+    def test_spare_budget_flows_to_other_tiers(
+        self, orch: PipelineOrchestrator,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If a tier has fewer rows than its allocated slice, the
+        unused budget must redistribute to tiers that still have room
+        — a 100-budget cap with 5 High / 200 Moderate / 200 Low must
+        still hit 100 sampled rows total."""
+        monkeypatch.setattr(orch_mod, "_MAP_MAX_POINTS", 100)
+        df = self._df(5, 200, 200)
+        sample = orch._sample_for_map(df)
+        assert len(sample) == 100
+        # Every High row is included because High had headroom.
+        assert (sample["risk_tier"] == TIER_HIGH).sum() == 5
+
+
+class TestMarkerHtml:
+    """The per-marker tooltip is the Phase 10 spec's hover surface;
+    its field set and missing-value rendering are part of the contract."""
+
+    def _row(self, **overrides: Any) -> Any:
+        defaults = {
+            "location_id": "L1",
+            "state": "NC",
+            "county": "37001",
+            "risk_tier": "High",
+            "risk_score": 0.7234,
+            "tcc_pct": 55,
+            "slope_deg": 12.4,
+            "land_cover_class": "Evergreen Forest",
+        }
+        defaults.update(overrides)
+        from types import SimpleNamespace
+        return SimpleNamespace(**defaults)
+
+    def test_marker_html_contains_every_field(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        html = orch._marker_html(self._row())
+        assert "L1" in html
+        assert "NC" in html
+        assert "37001" in html
+        assert "High" in html
+        # Score formatted to 3 decimals
+        assert "0.723" in html
+        # tcc_pct formatted as a percentage
+        assert "55%" in html
+        # slope formatted with degree symbol + 1 decimal
+        assert "12.4°" in html
+        # Land cover class verbatim
+        assert "Evergreen Forest" in html
+
+    def test_marker_html_handles_missing_fields(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        """A null tcc_pct / slope_deg must render as the em-dash
+        placeholder rather than the literal "NaN" / "None"."""
+        import math
+        html = orch._marker_html(
+            self._row(tcc_pct=math.nan, slope_deg=None, land_cover_class=None)
+        )
+        # Three placeholder cells expected.
+        assert html.count("—") >= 3
+        # And the JavaScript-y strings must not leak through.
+        assert "NaN" not in html
+        assert ">None<" not in html

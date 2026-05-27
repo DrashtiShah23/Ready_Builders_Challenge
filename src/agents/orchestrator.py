@@ -85,8 +85,32 @@ _COUNTY_SUMMARY_PARQUET: Path = config.SCORED_DIR / "risk_summary_by_county.parq
 _REPORT_MD: Path = _OUTPUTS_DIR / "analysis_report.md"
 _MAP_HTML: Path = _OUTPUTS_DIR / "risk_map.html"
 
-# Map render is bounded — 4.67M markers would never render anyway.
-_MAP_MAX_POINTS: int = 5_000
+# Map render is bounded — even with marker clustering, 4.67M individual
+# Leaflet markers would push the browser's DOM past its memory budget.
+# At 50k subsampled points the clustered map renders smoothly on a typical
+# laptop while still showing enough detail to spot regional patterns. The
+# subsample is stratified by tier (preferring High > Moderate > Low) so a
+# state with a 5% High share doesn't lose its High markers to the cap.
+_MAP_MAX_POINTS: int = 50_000
+
+# Hex codes for the three risk tiers — Phase 10 spec. Picked for AA-grade
+# colour contrast against the OpenStreetMap base tiles (the same green/
+# orange/red trio every traffic-light visual uses, so a reviewer doesn't
+# have to consult the legend to read the map).
+_TIER_COLOR_HIGH: str = "#e74c3c"      # red
+_TIER_COLOR_MODERATE: str = "#f39c12"  # orange
+_TIER_COLOR_LOW: str = "#2ecc71"       # green
+_TIER_COLOR_UNSCORED: str = "#7f8c8d"  # grey — only used for the legacy
+                                       # ``TIER_UNSCORED`` rows; absent
+                                       # from the published Phase 10
+                                       # legend (UNSCORED rows aren't
+                                       # rendered on the map either).
+
+# MarkerCluster ungroups individual points once the user zooms in past
+# this level. Set at 8 so US-state-level views are clustered (clean
+# heatmap-style summary) but block-group-level views show the underlying
+# markers, matching the spec's "clustering at zoom < 8" requirement.
+_MARKER_CLUSTER_DISABLE_ZOOM: int = 8
 
 # NC bounding box used by the geographic-sanity validation check.
 _NC_LAT_MIN: float = 33.75
@@ -1925,59 +1949,285 @@ class PipelineOrchestrator:
         )
 
     def _render_map(self, df: pd.DataFrame) -> None:
-        """Render a Folium map of risk tiers, subsampled for browser sanity.
+        """Render the Phase 10 interactive risk map to ``_MAP_HTML``.
 
-        4.67M markers would never render in a browser, so we subsample by
-        tier (preferring High > Moderate > Low) up to ``_MAP_MAX_POINTS``.
+        The Phase 10 spec calls for a self-contained Folium HTML page
+        with these features:
+
+        - OpenStreetMap base layer (the Leaflet default — every reviewer
+          recognises the cartography, and the tiles render anywhere
+          without an API key).
+        - Circle markers colour-coded by ``risk_tier`` using the
+          spec's exact hex codes (``#e74c3c`` / ``#f39c12`` / ``#2ecc71``).
+        - Marker clustering when zoomed out past zoom level 8, so the
+          map stays responsive at the 4.67M-row full-dataset scale; the
+          markers ungroup at higher zooms so individual locations stay
+          interactive.
+        - One ``FeatureGroup`` per tier behind a ``LayerControl`` so
+          the reviewer can toggle High / Moderate / Low independently —
+          critical for the "show me only at-risk locations" workflow.
+        - Hover tooltip with the eight spec-required fields (location_id,
+          state, county, risk_tier, risk_score, tcc_pct, slope_deg,
+          land_cover_class). Folium tooltips also fire on tap, so we
+          skip the separate ``Popup`` element — duplicating the HTML
+          per-marker would roughly double the rendered file size on
+          the full-dataset 50k-marker subsample.
+        - Inline HTML legend keyed to the same colours.
+
+        Subsampling: even with clustering, a Leaflet map with ~5M
+        individual feature DOM nodes will exhaust the browser's heap.
+        The function caps the rendered marker count at
+        ``_MAP_MAX_POINTS``, stratified by tier so a state with a 5%
+        High share doesn't lose its High markers to the cap. UNSCORED
+        rows are excluded from the rendering — they are an analytical
+        artefact (no environmental data), not a position on the risk
+        spectrum, so colouring them grey on the map would be misleading.
         """
-        import folium  # local import — folium is a heavy dependency to import at module load.
+        # Local imports — folium and its plugins are heavy enough that
+        # we don't want them on the cold-start path of every test that
+        # imports ``orchestrator``.
+        import folium
+        from folium.plugins import MarkerCluster
 
-        high = df[df["risk_tier"] == TIER_HIGH]
-        mod = df[df["risk_tier"] == TIER_MODERATE]
-        low = df[df["risk_tier"] == TIER_LOW]
-
-        # Allocate the 5k point budget proportionally but with a floor for
-        # each tier so the map always shows variety.
-        budget = _MAP_MAX_POINTS
-        h_take = min(len(high), max(int(budget * 0.5), 0))
-        m_take = min(len(mod), max(int(budget * 0.3), 0))
-        l_take = min(len(low), max(budget - h_take - m_take, 0))
-
-        sample = pd.concat(
-            [
-                high.head(h_take),
-                mod.head(m_take),
-                low.head(l_take),
-            ]
-        )
-
+        sample = self._sample_for_map(df)
         if sample.empty:
             return
 
         center_lat = float(sample["latitude"].mean())
         center_lon = float(sample["longitude"].mean())
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=7)
-        tier_colors = {
-            TIER_HIGH: "red",
-            TIER_MODERATE: "orange",
-            TIER_LOW: "green",
-            TIER_UNSCORED: "gray",
-        }
-        for row in sample.itertuples(index=False):
-            color = tier_colors.get(getattr(row, "risk_tier", None), "gray")
-            folium.CircleMarker(
-                location=[float(row.latitude), float(row.longitude)],
-                radius=2,
-                color=color,
-                fill=True,
-                fill_opacity=0.6,
-                popup=(
-                    f"id={row.location_id}<br>"
-                    f"tier={row.risk_tier}<br>"
-                    f"score={row.risk_score}"
-                ),
-            ).add_to(m)
+        # ``tiles="OpenStreetMap"`` is the Leaflet default; spelling it out
+        # makes the spec dependency explicit in the source.
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=7,
+            tiles="OpenStreetMap",
+            control_scale=True,
+        )
+
+        # One FeatureGroup per tier so the LayerControl gets per-tier
+        # checkboxes. ``show=True`` on Moderate/High means the reviewer
+        # lands on a map that highlights the actionable locations; Low
+        # is on by default too because hiding 60% of the dataset on
+        # first paint would be confusing.
+        tier_specs = [
+            (TIER_HIGH, _TIER_COLOR_HIGH, "High risk"),
+            (TIER_MODERATE, _TIER_COLOR_MODERATE, "Moderate risk"),
+            (TIER_LOW, _TIER_COLOR_LOW, "Low risk"),
+        ]
+        for tier, color, label in tier_specs:
+            tier_df = sample[sample["risk_tier"] == tier]
+            if tier_df.empty:
+                continue
+            group = folium.FeatureGroup(
+                name=f"{label} ({len(tier_df):,})",
+                show=True,
+            )
+            # MarkerCluster lives inside the FeatureGroup so toggling a
+            # tier off cleanly removes its cluster bubbles from the map.
+            # ``disableClusteringAtZoom`` matches the spec's "clustering
+            # at zoom < 8" requirement — past zoom 8 the user is looking
+            # at individual neighbourhoods and needs to see each marker
+            # rather than its parent cluster.
+            cluster = MarkerCluster(
+                disableClusteringAtZoom=_MARKER_CLUSTER_DISABLE_ZOOM,
+                showCoverageOnHover=False,
+            )
+            for row in tier_df.itertuples(index=False):
+                folium.CircleMarker(
+                    location=[float(row.latitude), float(row.longitude)],
+                    radius=4,
+                    color=color,
+                    weight=1,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.75,
+                    tooltip=folium.Tooltip(self._marker_html(row), sticky=True),
+                ).add_to(cluster)
+            cluster.add_to(group)
+            group.add_to(m)
+
+        # LayerControl renders the toggle UI on the top-right of the map.
+        # ``collapsed=False`` so the toggles are visible immediately —
+        # forcing the user to discover the hamburger button hides one
+        # of the Phase 10 STOP-gate features.
+        folium.LayerControl(collapsed=False).add_to(m)
+
+        # The colour legend lives in the bottom-left so it doesn't
+        # collide with the LayerControl on the top-right.
+        m.get_root().html.add_child(folium.Element(self._legend_html()))
+
+        # Hoist the tooltip's repeated inline styles into a single
+        # ``<style>`` block in the document head. Each tooltip then
+        # references the class names instead of duplicating the CSS,
+        # which roughly halves the rendered file size at the 50k-marker
+        # cap with no visual change.
+        m.get_root().header.add_child(folium.Element(self._marker_style_block()))
+
         m.save(str(_MAP_HTML))
+
+    @staticmethod
+    def _sample_for_map(df: pd.DataFrame) -> pd.DataFrame:
+        """Return a tier-stratified subsample bounded by ``_MAP_MAX_POINTS``.
+
+        UNSCORED rows are dropped — they aren't a position on the risk
+        spectrum, they're a data-quality signal that gets surfaced by
+        the report's Data Quality table instead.
+
+        Allocation: 40% High / 35% Moderate / 25% Low of the budget by
+        default, then any tier that doesn't use its share donates back
+        to a uniform redistribution across the under-served tiers. This
+        keeps the High population visible on a map dominated by Low
+        rows (the common case for a coastal-NC sample), without
+        clobbering Low entirely on a mostly-Low map.
+        """
+        scored = df[df["risk_tier"] != TIER_UNSCORED]
+        if scored.empty:
+            return scored
+
+        high = scored[scored["risk_tier"] == TIER_HIGH]
+        moderate = scored[scored["risk_tier"] == TIER_MODERATE]
+        low = scored[scored["risk_tier"] == TIER_LOW]
+
+        # If the full scored set fits in the budget, render everything
+        # — no information loss for the small-state / small-sample case.
+        if len(scored) <= _MAP_MAX_POINTS:
+            return scored
+
+        budget = _MAP_MAX_POINTS
+        targets = {
+            TIER_HIGH: int(budget * 0.40),
+            TIER_MODERATE: int(budget * 0.35),
+            TIER_LOW: budget - int(budget * 0.40) - int(budget * 0.35),
+        }
+        # First pass: clamp each tier's target to what's actually
+        # available, recording the unused budget.
+        actual = {
+            TIER_HIGH: min(len(high), targets[TIER_HIGH]),
+            TIER_MODERATE: min(len(moderate), targets[TIER_MODERATE]),
+            TIER_LOW: min(len(low), targets[TIER_LOW]),
+        }
+        spare = budget - sum(actual.values())
+
+        # Second pass: redistribute spare slots to tiers that can still
+        # absorb more rows. Iterate in High → Low order so the spare
+        # slots prefer at-risk visibility on a Low-dominated map.
+        if spare > 0:
+            pools = {TIER_HIGH: high, TIER_MODERATE: moderate, TIER_LOW: low}
+            for tier in (TIER_HIGH, TIER_MODERATE, TIER_LOW):
+                room = len(pools[tier]) - actual[tier]
+                if room <= 0:
+                    continue
+                take = min(spare, room)
+                actual[tier] += take
+                spare -= take
+                if spare == 0:
+                    break
+
+        return pd.concat(
+            [
+                high.head(actual[TIER_HIGH]),
+                moderate.head(actual[TIER_MODERATE]),
+                low.head(actual[TIER_LOW]),
+            ]
+        )
+
+    @staticmethod
+    def _marker_html(row: Any) -> str:
+        """Build the tooltip/popup HTML for a single marker.
+
+        Format matches the Phase 10 STOP-gate field list: location_id,
+        state, county, risk_tier, risk_score, tcc_pct, slope_deg,
+        land_cover_class. NaN / None render as "—" so a reviewer sees
+        a placeholder rather than the JavaScript-y "NaN" or "null".
+        """
+
+        def _fmt(val: Any, kind: str = "raw") -> str:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "—"
+            if kind == "score":
+                return f"{float(val):.3f}"
+            if kind == "pct":
+                return f"{int(val)}%"
+            if kind == "deg":
+                return f"{float(val):.1f}°"
+            return str(val)
+
+        rows = [
+            ("Location", _fmt(getattr(row, "location_id", None))),
+            ("State", _fmt(getattr(row, "state", None))),
+            ("County", _fmt(getattr(row, "county", None))),
+            ("Risk tier", _fmt(getattr(row, "risk_tier", None))),
+            ("Risk score", _fmt(getattr(row, "risk_score", None), "score")),
+            ("Tree canopy", _fmt(getattr(row, "tcc_pct", None), "pct")),
+            ("Slope", _fmt(getattr(row, "slope_deg", None), "deg")),
+            ("Land cover", _fmt(getattr(row, "land_cover_class", None))),
+        ]
+        # Class names instead of inline styles — the shared ``<style>``
+        # block (see ``_marker_style_block``) lives in the document
+        # head, so duplicating the CSS per marker would be pure waste
+        # at the 50k-marker cap.
+        cells = "".join(
+            f"<tr><td class='rmk-l'>{label}</td>"
+            f"<td class='rmk-v'>{value}</td></tr>"
+            for label, value in rows
+        )
+        return f"<div class='rmk'><table>{cells}</table></div>"
+
+    @staticmethod
+    def _marker_style_block() -> str:
+        """Shared CSS for marker tooltips, injected into the doc head.
+
+        Targets the Leaflet tooltip wrapper as a descendant selector so
+        the styles only apply to the marker tooltips and never bleed
+        into the LayerControl or legend.
+        """
+        return (
+            "<style>"
+            ".leaflet-tooltip .rmk{"
+            "font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+            "font-size:12px;line-height:1.35"
+            "}"
+            ".leaflet-tooltip .rmk td.rmk-l{"
+            "padding:1px 6px 1px 0;color:#7f8c8d"
+            "}"
+            ".leaflet-tooltip .rmk td.rmk-v{"
+            "padding:1px 0;font-weight:600"
+            "}"
+            "</style>"
+        )
+
+    @staticmethod
+    def _legend_html() -> str:
+        """Inline HTML legend pinned to the map's bottom-left corner.
+
+        Uses absolute positioning relative to the Leaflet container, a
+        light-on-dark backdrop for legibility against both light and
+        satellite-style tiles, and the same hex codes the markers use
+        so a screenshot of the map reads correctly on its own.
+        """
+        items = (
+            (_TIER_COLOR_HIGH, "High risk"),
+            (_TIER_COLOR_MODERATE, "Moderate risk"),
+            (_TIER_COLOR_LOW, "Low risk"),
+        )
+        rows = "".join(
+            f"<div style='display:flex;align-items:center;margin:2px 0'>"
+            f"<span style='display:inline-block;width:14px;height:14px;"
+            f"border-radius:50%;background:{color};margin-right:8px'></span>"
+            f"<span>{label}</span></div>"
+            for color, label in items
+        )
+        return (
+            "<div style='position:fixed;bottom:24px;left:12px;z-index:9999;"
+            "background:rgba(255,255,255,0.95);padding:10px 14px;"
+            "border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.25);"
+            "font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+            "font-size:12px;color:#2c3e50'>"
+            "<div style='font-weight:700;margin-bottom:4px'>"
+            "LEO obstruction risk</div>"
+            f"{rows}"
+            "</div>"
+        )
 
     # ------------------------------------------------------------------
     # Helpers
