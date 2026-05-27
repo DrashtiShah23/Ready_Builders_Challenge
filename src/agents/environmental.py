@@ -40,8 +40,11 @@ Any environmental field that comes back null is reflected in
 
 ``ASPECT_MISSING`` is ambiguous (flat terrain genuinely has no aspect) and
 is included only because the field can be null for non-failure reasons.
-The composite v3.0 risk formula does NOT depend on aspect — it's surfaced
-only for Claude's anomaly reasoning in Phase 7.
+The composite v3.0 risk formula does NOT depend on aspect — it's persisted
+into ``EnrichedLocation`` alongside slope so downstream consumers (the
+validation tool's geographic-sanity check, the per-county summary, any
+future hemisphere-aware scoring variant) have it on hand without
+re-reading the DEM.
 """
 from __future__ import annotations
 
@@ -79,6 +82,15 @@ class EnvironmentalAgent:
     """
 
     def __init__(self, logger: Optional[PipelineLogger] = None) -> None:
+        """Initialise the per-run cumulative counters.
+
+        ``logger`` is optional so the agent can be driven from a notebook
+        without first wiring up the structured logger. ``cumulative_missing``
+        is the per-signal running total across every batch in the run;
+        :meth:`log_run_summary` reads it at end-of-run to emit the
+        ``ENRICHMENT_SUMMARY`` event the orchestrator's ``score_risk``
+        tool reasons about.
+        """
         self.logger = logger or PipelineLogger(
             run_id=f"env-{uuid.uuid4().hex[:8]}"
         )

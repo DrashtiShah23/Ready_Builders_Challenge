@@ -395,6 +395,14 @@ def _output_quality(
     missing_rates = _enrichment_missing_rates(events)
     validation_status = _validation_status(events)
 
+    # Output quality anomaly detection note
+    #
+    # Anomaly detection accuracy cannot be computed without ground truth labels.
+    # Current checks are rule based statistical flags based on distribution sanity,
+    # cross validation, geographic bounds, and missing data rates.
+    # Accuracy becomes measurable when installer field visit outcomes are collected
+    # and matched back to location_ids.
+
     base: dict[str, Any] = {
         "scored_path": str(scored_path) if scored_path else None,
         "total_locations": None,

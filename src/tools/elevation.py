@@ -20,10 +20,11 @@ Design notes
 - **Aspect is computed per-point.** Phase 2 only pre-computes slope, not
   aspect, so we read a 3x3 elevation window from the underlying DEM tile
   and run Horn's method on it. Aspect doesn't feed the composite risk
-  score in the v3.0 formula but is exposed for Claude's anomaly reasoning
-  (e.g. "north-facing slope + high canopy = likely high risk"). If aspect
-  becomes a bottleneck at full CONUS scale we can lift the same Horn
-  kernel into the downloader's pre-compute step.
+  score in the v3.0 formula; it's persisted into ``EnrichedLocation``
+  alongside slope so downstream consumers (the validation tool, the
+  per-county summary, future hemisphere-aware scoring) have it on hand.
+  If aspect becomes a bottleneck at full CONUS scale we can lift the
+  same Horn kernel into the downloader's pre-compute step.
 - **DEM tile lookup.** USGS 3DEP 1 arc-second products are distributed
   as 1°x1° tiles. We build a one-time in-process bounds index on first
   call and pick the tile whose footprint contains the request point.

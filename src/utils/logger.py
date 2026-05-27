@@ -43,6 +43,13 @@ class PipelineLogger:
     """Append-only JSONL writer scoped to a single pipeline run."""
 
     def __init__(self, run_id: str) -> None:
+        """Open a JSONL log for ``run_id`` at ``LOG_DIR/pipeline_run_{run_id}.jsonl``.
+
+        The file is created on first ``_write`` call (append mode), not
+        on construction — so instantiating a logger has zero filesystem
+        side-effects and tests can pass a synthetic ``run_id`` without
+        polluting ``logs/``.
+        """
         self.run_id = run_id
         self.log_path: Path = LOG_DIR / f"pipeline_run_{run_id}.jsonl"
 
@@ -58,6 +65,13 @@ class PipelineLogger:
         token_input: Optional[int] = None,
         token_output: Optional[int] = None,
     ) -> None:
+        """Append one structured event to the log file.
+
+        All fields are stamped onto a single JSON object so a downstream
+        consumer (Phase 11 metrics, `jq`, DuckDB `read_json_auto`) can
+        select by ``stage`` / ``event_type`` / ``level`` without writing
+        a parser.
+        """
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": level,
@@ -74,10 +88,13 @@ class PipelineLogger:
             f.write(json.dumps(entry, default=str) + "\n")
 
     def info(self, stage: str, event_type: str, **kwargs: Any) -> None:
+        """Log an INFO-level event. See ``_write`` for full kwarg list."""
         self._write("INFO", stage, event_type, **kwargs)
 
     def warning(self, stage: str, event_type: str, **kwargs: Any) -> None:
+        """Log a WARNING-level event. Use for missing data / soft failures."""
         self._write("WARNING", stage, event_type, **kwargs)
 
     def error(self, stage: str, event_type: str, **kwargs: Any) -> None:
+        """Log an ERROR-level event. Use for tool failures / fatal stops."""
         self._write("ERROR", stage, event_type, **kwargs)

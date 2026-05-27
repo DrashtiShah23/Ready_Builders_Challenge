@@ -1,5 +1,5 @@
 """
-Pipeline Orchestrator: single-call Claude design (Phase 7 redesign).
+Pipeline Orchestrator: ~6-turn Claude orchestration design (Phase 7 redesign).
 
 Why pipeline-level orchestration instead of per-batch reasoning
 ---------------------------------------------------------------
@@ -9,7 +9,8 @@ calls and roughly $10,600 in API spend — prohibitively expensive for a
 challenge submission and never the right shape for a production pipeline.
 
 The redesign keeps **all** of the agentic reasoning, just at the right scale:
-Claude makes ONE API call total, with five pipeline-level tools. Each tool
+Claude runs one orchestration session of approximately 6 turns (tool_use
+loop) with five pipeline-level tools. Each tool
 internally runs the full dataset through the existing Phase 1-6 agents (the
 ingestion, environmental, and scoring modules are untouched). Claude reasons
 about the **summary** of each step, flags anomalies between steps, decides
@@ -50,7 +51,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 import anthropic
+import duckdb
 import pandas as pd
+from branca.element import MacroElement
+from jinja2 import Template
 
 from src import config
 from src.agents.environmental import EnvironmentalAgent
@@ -67,6 +71,7 @@ from src.schemas.location import ValidatedLocation
 from src.tools.elevation import fetch_elevation
 from src.tools.landcover import fetch_land_cover
 from src.tools.tcc import fetch_tcc
+from src.utils.geo import find_better_alternatives
 from src.utils.logger import PipelineLogger
 
 
@@ -113,16 +118,138 @@ _TIER_COLOR_UNSCORED: str = "#7f8c8d"  # grey — only used for the legacy
 _MARKER_CLUSTER_DISABLE_ZOOM: int = 8
 
 # NC bounding box used by the geographic-sanity validation check.
-_NC_LAT_MIN: float = 33.75
-_NC_LAT_MAX: float = 36.59
-_NC_LON_MIN: float = -84.32
-_NC_LON_MAX: float = -75.46
+# Sourced from ``config.STATE_BBOX_WGS84`` so there's exactly one place
+# to update bounds — the downloader, the validation check, and any
+# future per-state report all read the same tuple. Unpacked into named
+# floats here so the validation-check code reads naturally
+# (``row.latitude < _NC_LAT_MIN`` vs. indexing into a tuple).
+_NC_LON_MIN, _NC_LAT_MIN, _NC_LON_MAX, _NC_LAT_MAX = config.STATE_BBOX_WGS84["NC"]
 
-# Thresholds named here so the validation check bodies are self-documenting.
-_DOMINANT_TIER_THRESHOLD: float = 0.80
-_FOREST_LOW_TCC_THRESHOLD: int = 10
-_FOREST_LOW_TCC_RATE_FLAG: float = 0.001
-_MISSING_DATA_FLAG_THRESHOLD: float = 0.15
+# Validation-policy thresholds. These are deliberately module-local
+# (not in ``src.config``) because they are the orchestrator's internal
+# tuning knobs for the four validation checks Claude reasons about —
+# they don't change the scoring formula, they don't affect downstream
+# tools, and they only matter to ``_run_validate_results``. Named here
+# so the check bodies read self-documenting rather than as bare
+# numeric literals, and so the test suite can monkeypatch them per
+# case.
+_DOMINANT_TIER_THRESHOLD: float = 0.80      # >80% in any tier → distribution-sanity warning
+_FOREST_LOW_TCC_THRESHOLD: int = 10         # tcc_pct < 10% on a forest pixel → cross-val flag
+_FOREST_LOW_TCC_RATE_FLAG: float = 0.001    # >0.1% of forest pixels with low TCC → check
+_MISSING_DATA_FLAG_THRESHOLD: float = 0.15  # any single signal >15% missing → warning
+
+# Map subsample budget allocation, by tier (must sum to ≤ 1.0). High
+# is over-represented because the report's primary "show me at-risk
+# locations" workflow benefits from every High marker being visible;
+# unused budget is redistributed to the still-hungry tiers in
+# ``_sample_for_map``.
+_MAP_QUOTA_HIGH: float = 0.40
+_MAP_QUOTA_MODERATE: float = 0.35
+_MAP_QUOTA_LOW: float = 0.25
+assert (
+    abs(_MAP_QUOTA_HIGH + _MAP_QUOTA_MODERATE + _MAP_QUOTA_LOW - 1.0) < 1e-9
+), "Map subsample tier quotas must sum to 1.0"
+
+
+# ---------------------------------------------------------------------------
+# Folium county filter (Phase 12)
+# ---------------------------------------------------------------------------
+
+
+class _RegionFilterControl(MacroElement):
+    """Leaflet control: dropdowns to filter markers by state and county."""
+
+    _template = Template(
+        """
+        {% macro html(this, kwargs) %}
+        <div id="region-filter-wrapper" style="
+            position:absolute;top:80px;left:12px;z-index:9999;
+            background:#fff;padding:8px 10px;border-radius:4px;
+            box-shadow:0 1px 5px rgba(0,0,0,0.35);font-family:-apple-system,sans-serif;">
+            <div style="margin-bottom:6px;">
+              <label for="state-filter-select" style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">
+                Filter by state
+              </label>
+              <select id="state-filter-select" style="font-size:12px;min-width:160px;">
+                  <option value="">All states</option>
+                  {% for s in this.states %}
+                  <option value="{{ s }}">{{ s }}</option>
+                  {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label for="county-filter-select" style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">
+                Filter by county (GEOID)
+              </label>
+              <select id="county-filter-select" style="font-size:12px;min-width:160px;">
+                  <option value="">All counties</option>
+                  {% for c in this.counties %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+              </select>
+            </div>
+        </div>
+        {% endmacro %}
+        {% macro script(this, kwargs) %}
+        (function() {
+            var stateSelect = document.getElementById('state-filter-select');
+            var countySelect = document.getElementById('county-filter-select');
+            if (!stateSelect || !countySelect) return;
+            var tierGroupNames = {{ this.tier_group_names|tojson }};
+
+            function applyToMarker(marker, selectedState, selectedCounty) {
+                var props = marker.feature && marker.feature.properties;
+                if (!props) return;
+                var st = props.state || '';
+                var cty = props.county || '';
+                var showState = !selectedState || st === selectedState;
+                var showCounty = !selectedCounty || cty === selectedCounty;
+                var show = showState && showCounty;
+                if (marker.setStyle) {
+                    marker.setStyle({
+                        opacity: show ? 0.85 : 0,
+                        fillOpacity: show ? 0.75 : 0
+                    });
+                }
+                var el = marker.getElement && marker.getElement();
+                if (el) {
+                    el.style.display = show ? '' : 'none';
+                    el.style.pointerEvents = show ? '' : 'none';
+                }
+            }
+
+            function walkLayer(layer, selectedState, selectedCounty) {
+                if (layer.eachLayer) {
+                    layer.eachLayer(function(child) {
+                        walkLayer(child, selectedState, selectedCounty);
+                    });
+                } else {
+                    applyToMarker(layer, selectedState, selectedCounty);
+                }
+            }
+
+            function applyFilters() {
+                var selectedState = stateSelect.value;
+                var selectedCounty = countySelect.value;
+                tierGroupNames.forEach(function(name) {
+                    var group = window[name];
+                    if (!group) return;
+                    walkLayer(group, selectedState, selectedCounty);
+                });
+            }
+
+            stateSelect.addEventListener('change', applyFilters);
+            countySelect.addEventListener('change', applyFilters);
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, states: list[str], counties: list[str], tier_group_names: list[str]) -> None:
+        super().__init__()
+        self.states = states
+        self.counties = counties
+        self.tier_group_names = tier_group_names
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +258,52 @@ _MISSING_DATA_FLAG_THRESHOLD: float = 0.15
 # when to invoke each tool and what to do with the return value.
 # ---------------------------------------------------------------------------
 
+TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, str]] = {
+    "ingest_locations": {
+        "status": "string",
+        "total_rows": "integer",
+        "valid_rows": "integer",
+        "dropped_rows": "integer",
+        "valid_pct": "number",
+        "drop_breakdown": "object",
+        "state_distribution": "object",
+        "output_path": "string",
+        "critical_failure": "boolean",
+        "notes": "string",
+    },
+    "sample_environment": {
+        "status": "string",
+        "total_locations": "integer",
+        "enriched_locations": "integer",
+        "missing_rates": "object",
+        "output_path": "string",
+        "raster_files_used": "object",
+        "notes": "string",
+    },
+    "score_risk": {
+        "status": "string",
+        "total_scored": "integer",
+        "unscored": "integer",
+        "tier_distribution": "object",
+        "mean_composite_score": "number|null",
+        "output_path": "string",
+        "dominant_tier_flag": "boolean",
+        "notes": "string",
+    },
+    "validate_results": {
+        "status": "string",
+        "checks": "object",
+        "total_warnings": "integer",
+        "recommendation": "string",
+        "notes": "string",
+    },
+    "generate_report": {
+        "status": "string",
+        "outputs": "object",
+        "key_findings": "object",
+    },
+}
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "ingest_locations",
@@ -138,7 +311,10 @@ TOOLS: list[dict[str, Any]] = [
             "Load and validate the locations CSV. Runs chunked validation, "
             "deduplication, and geoid_cb derivation for state/county. "
             "Returns a quality summary — do NOT proceed to sample_environment "
-            "if critical_failure is True or valid_pct is below 0.80."
+            "if critical_failure is True or valid_pct is below 0.80. "
+            "Returns: {status: string, total_rows: int, valid_rows: int, dropped_rows: int, "
+            "valid_pct: number, drop_breakdown: object, state_distribution: object, "
+            "output_path: string, critical_failure: bool, notes: string}"
         ),
         "input_schema": {
             "type": "object",
@@ -157,6 +333,7 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["file_path"],
         },
+        "output_schema": TOOL_OUTPUT_SCHEMAS["ingest_locations"],
     },
     {
         "name": "sample_environment",
@@ -165,7 +342,9 @@ TOOLS: list[dict[str, Any]] = [
             "and land cover from local raster files. Opens raster handles once "
             "per RASTER_BATCH_SIZE chunk for memory efficiency. "
             "Returns enrichment summary with missing-data rates per signal. "
-            "Flag to Claude if any signal is missing for more than 10 percent of rows."
+            "Flag to Claude if any signal is missing for more than 10 percent of rows. "
+            "Returns: {status: string, total_locations: int, enriched_locations: int, "
+            "missing_rates: object, output_path: string, raster_files_used: object, notes: string}"
         ),
         "input_schema": {
             "type": "object",
@@ -177,6 +356,7 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["validated_locations_path"],
         },
+        "output_schema": TOOL_OUTPUT_SCHEMAS["sample_environment"],
     },
     {
         "name": "score_risk",
@@ -185,7 +365,9 @@ TOOLS: list[dict[str, Any]] = [
             "Formula: (tcc_score * 0.50) + (terrain_score * 0.30) + (landcover_score * 0.20). "
             "Returns scored locations and tier distribution. "
             "Flag to Claude if more than 80 percent of locations fall in the same tier — "
-            "that is a signal the thresholds may need review."
+            "that is a signal the thresholds may need review. "
+            "Returns: {status: string, total_scored: int, unscored: int, tier_distribution: object, "
+            "mean_composite_score: number|null, output_path: string, dominant_tier_flag: bool, notes: string}"
         ),
         "input_schema": {
             "type": "object",
@@ -197,6 +379,7 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["enriched_locations_path"],
         },
+        "output_schema": TOOL_OUTPUT_SCHEMAS["score_risk"],
     },
     {
         "name": "validate_results",
@@ -206,7 +389,8 @@ TOOLS: list[dict[str, Any]] = [
             "(2) cross-validation — flag locations where land_cover is forest but tcc_pct is below 10, "
             "(3) geographic sanity — flag locations outside NC bounding box or in water, "
             "(4) missing data rate — flag if more than 15 percent missing any single signal. "
-            "Returns validation report. Claude should review anomalies before calling generate_report."
+            "Returns validation report. Claude should review anomalies before calling generate_report. "
+            "Returns: {status: string, checks: object, total_warnings: int, recommendation: string, notes: string}"
         ),
         "input_schema": {
             "type": "object",
@@ -218,6 +402,7 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["scored_locations_path"],
         },
+        "output_schema": TOOL_OUTPUT_SCHEMAS["validate_results"],
     },
     {
         "name": "generate_report",
@@ -227,7 +412,8 @@ TOOLS: list[dict[str, Any]] = [
             "Produces: outputs/analysis_report.md, "
             "outputs/scored/risk_summary_by_state.parquet, "
             "outputs/scored/risk_summary_by_county.parquet, "
-            "outputs/risk_map.html."
+            "outputs/risk_map.html. "
+            "Returns: {status: string, outputs: object, key_findings: object}"
         ),
         "input_schema": {
             "type": "object",
@@ -245,6 +431,7 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["scored_locations_path", "validation_report"],
         },
+        "output_schema": TOOL_OUTPUT_SCHEMAS["generate_report"],
     },
 ]
 
@@ -296,7 +483,7 @@ ToolEndHook = Callable[[str, float, int, int], None]
 
 
 class PipelineOrchestrator:
-    """Drive the full pipeline via a single Claude call with five tools.
+    """Drive the full pipeline via one orchestration session (~6 turns) with five tools.
 
     Lifecycle:
         1. Construct with an API key + logger.
@@ -305,6 +492,15 @@ class PipelineOrchestrator:
     """
 
     def __init__(self, api_key: str, logger: PipelineLogger) -> None:
+        """Construct an orchestrator with a live Anthropic client and a logger.
+
+        The Anthropic client is constructed eagerly so a malformed API
+        key surfaces immediately (the SDK doesn't validate the key
+        until first request, but the constructor catches obvious shape
+        errors). The logger must be the same instance the pipeline-wide
+        SIGINT handler uses so an interrupted run leaves one coherent
+        JSONL stream.
+        """
         self.client = anthropic.Anthropic(api_key=api_key)
         self.logger = logger
         self.tools = TOOLS
@@ -520,15 +716,31 @@ class PipelineOrchestrator:
             "duration_ms": elapsed_ms,
         }
 
-    def run_interactive(self, latitude: float, longitude: float) -> dict[str, Any]:
+    def run_interactive(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        buffer_meters: Optional[float] = None,
+    ) -> dict[str, Any]:
         """Single-location analysis with per-location Claude reasoning.
 
         This is the **only** path in the redesign where Claude sees an
         individual location. It demonstrates the "user gives coordinates,
         agent explains sky visibility" scenario at ~$0.01 per query, where
         applying it across 4.67M rows would be infeasible.
+
+        After scoring the query coordinate, searches ``scored_locations.parquet``
+        for up to three nearby locations within ``buffer_meters`` that have
+        strictly lower ``risk_score`` (Sample Agentic Scenario 3). Results
+        are returned under ``better_alternatives``.
         """
         run_start = time.monotonic()
+        search_radius = (
+            buffer_meters
+            if buffer_meters is not None
+            else config.INTERACTIVE_BUFFER_METERS
+        )
 
         tcc_result = fetch_tcc(latitude, longitude)
         elev_result = fetch_elevation(latitude, longitude)
@@ -596,11 +808,25 @@ class PipelineOrchestrator:
                 f"land_cover={location_payload['land_cover_class']}."
             )
 
+        better_alternatives = find_better_alternatives(
+            _SCORED_PARQUET,
+            latitude,
+            longitude,
+            score_result.get("risk_score"),
+            buffer_meters=search_radius,
+            top_n=config.INTERACTIVE_ALTERNATIVES_TOP_N,
+        )
+
         elapsed_ms = int((time.monotonic() - run_start) * 1000)
         self.logger.info(
             stage="orchestrator",
             event_type="INTERACTIVE_DONE",
-            detail={"latitude": latitude, "longitude": longitude},
+            detail={
+                "latitude": latitude,
+                "longitude": longitude,
+                "buffer_meters": search_radius,
+                "alternatives_found": len(better_alternatives),
+            },
             duration_ms=elapsed_ms,
             token_input=token_in,
             token_output=token_out,
@@ -609,6 +835,128 @@ class PipelineOrchestrator:
         return {
             **location_payload,
             "explanation": explanation,
+            "token_input": token_in,
+            "token_output": token_out,
+            "buffer_meters": search_radius,
+            "better_alternatives": better_alternatives,
+        }
+
+    def run_interactive_county(self, county_query: str) -> dict[str, Any]:
+        """County area assessment for interactive mode.
+
+        Accepts a county GEOID or a county name, queries the scored parquet with DuckDB,
+        and returns tier distribution plus a short Claude summary.
+        """
+        scored_path = _SCORED_PARQUET
+        if not scored_path.exists():
+            return {
+                "status": "error",
+                "error": f"scored parquet not found at {scored_path}",
+            }
+
+        q = county_query.strip()
+        con = duckdb.connect()
+        columns = [
+            r[0]
+            for r in con.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)", [str(scored_path)]
+            ).fetchall()
+        ]
+        has_county_name = "county_name" in set(columns)
+        if q.isdigit():
+            where = "county = ?"
+            param = q
+        else:
+            if not has_county_name:
+                return {
+                    "status": "error",
+                    "error": "County name lookup is unavailable in this dataset. Use a 5 digit county GEOID.",
+                }
+            where = "lower(county_name) = lower(?)"
+            param = q
+
+        total = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet(?) WHERE {where}",
+            [str(scored_path), param],
+        ).fetchone()[0]
+        if total == 0:
+            return {"status": "ok", "county_query": county_query, "total_locations": 0}
+
+        tier_rows = con.execute(
+            f"""
+            SELECT risk_tier, COUNT(*) AS count
+            FROM read_parquet(?) WHERE {where}
+            GROUP BY risk_tier
+            """,
+            [str(scored_path), param],
+        ).fetchall()
+        tier_distribution: dict[str, dict[str, Any]] = {}
+        for tier, count in tier_rows:
+            tier_distribution[str(tier)] = {
+                "count": int(count),
+                "pct": round(int(count) / int(total), 4),
+            }
+
+        driver_row = con.execute(
+            f"""
+            SELECT
+              AVG(tcc_score) AS avg_tcc,
+              AVG(terrain_score) AS avg_terrain,
+              AVG(landcover_score) AS avg_landcover
+            FROM read_parquet(?) WHERE {where}
+            """,
+            [str(scored_path), param],
+        ).fetchone()
+        driver_map = {
+            "tree_canopy": float(driver_row[0]) if driver_row[0] is not None else 0.0,
+            "terrain": float(driver_row[1]) if driver_row[1] is not None else 0.0,
+            "land_cover": float(driver_row[2]) if driver_row[2] is not None else 0.0,
+        }
+        top_risk_driver = max(driver_map.items(), key=lambda kv: kv[1])[0]
+
+        prompt = {
+            "county_query": county_query,
+            "total_locations": int(total),
+            "tier_distribution": tier_distribution,
+            "top_risk_driver": top_risk_driver,
+        }
+        summary = ""
+        token_in = 0
+        token_out = 0
+        try:
+            response = self.client.messages.create(
+                model=config.CLAUDE_MODEL,
+                max_tokens=220,
+                system=(
+                    "You write a brief county level summary for a non technical state broadband officer. "
+                    "Be specific and concise."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarize this county risk distribution in 2 to 3 sentences. "
+                            "Name the top risk driver and what action the officer should take.\n\n"
+                            + json.dumps(prompt, indent=2)
+                        ),
+                    }
+                ],
+            )
+            summary = self._extract_text(response.content)
+            usage = getattr(response, "usage", None)
+            token_in = getattr(usage, "input_tokens", 0) if usage else 0
+            token_out = getattr(usage, "output_tokens", 0) if usage else 0
+            self._log_cost_estimate(token_in, token_out)
+        except Exception as exc:
+            summary = f"(Claude summary unavailable: {type(exc).__name__}: {exc}.)"
+
+        return {
+            "status": "ok",
+            "county_query": county_query,
+            "total_locations": int(total),
+            "tier_distribution": tier_distribution,
+            "top_risk_driver": top_risk_driver,
+            "summary": summary,
             "token_input": token_in,
             "token_output": token_out,
         }
@@ -1966,6 +2314,8 @@ class PipelineOrchestrator:
         - One ``FeatureGroup`` per tier behind a ``LayerControl`` so
           the reviewer can toggle High / Moderate / Low independently —
           critical for the "show me only at-risk locations" workflow.
+        - County dropdown (Phase 12) filtering markers by the 5-digit
+          county GEOID stored on each scored row.
         - Hover tooltip with the eight spec-required fields (location_id,
           state, county, risk_tier, risk_score, tcc_pct, slope_deg,
           land_cover_class). Folium tooltips also fire on tap, so we
@@ -1982,6 +2332,10 @@ class PipelineOrchestrator:
         rows are excluded from the rendering — they are an analytical
         artefact (no environmental data), not a position on the risk
         spectrum, so colouring them grey on the map would be misleading.
+
+        Markers are emitted as GeoJSON point features (not bare
+        ``CircleMarker`` calls) so each Leaflet layer carries a
+        ``county`` property the county-filter script can read.
         """
         # Local imports — folium and its plugins are heavy enough that
         # we don't want them on the cold-start path of every test that
@@ -2004,6 +2358,22 @@ class PipelineOrchestrator:
             control_scale=True,
         )
 
+        states = sorted(
+            {
+                str(s)
+                for s in sample["state"].dropna().unique()
+                if str(s).strip()
+            }
+        )
+        counties = sorted(
+            {
+                str(c)
+                for c in sample["county"].dropna().unique()
+                if str(c).strip()
+            }
+        )
+        tier_group_names: list[str] = []
+
         # One FeatureGroup per tier so the LayerControl gets per-tier
         # checkboxes. ``show=True`` on Moderate/High means the reviewer
         # lands on a map that highlights the actionable locations; Low
@@ -2022,6 +2392,7 @@ class PipelineOrchestrator:
                 name=f"{label} ({len(tier_df):,})",
                 show=True,
             )
+            tier_group_names.append(group.get_name())
             # MarkerCluster lives inside the FeatureGroup so toggling a
             # tier off cleanly removes its cluster bubbles from the map.
             # ``disableClusteringAtZoom`` matches the spec's "clustering
@@ -2032,17 +2403,41 @@ class PipelineOrchestrator:
                 disableClusteringAtZoom=_MARKER_CLUSTER_DISABLE_ZOOM,
                 showCoverageOnHover=False,
             )
-            for row in tier_df.itertuples(index=False):
-                folium.CircleMarker(
-                    location=[float(row.latitude), float(row.longitude)],
+            folium.GeoJson(
+                self._dataframe_to_geojson(tier_df),
+                marker=folium.CircleMarker(
                     radius=4,
                     color=color,
                     weight=1,
                     fill=True,
                     fill_color=color,
                     fill_opacity=0.75,
-                    tooltip=folium.Tooltip(self._marker_html(row), sticky=True),
-                ).add_to(cluster)
+                ),
+                tooltip=folium.GeoJsonTooltip(
+                    fields=[
+                        "location_id",
+                        "state",
+                        "county",
+                        "risk_tier",
+                        "risk_score",
+                        "tcc_pct",
+                        "slope_deg",
+                        "land_cover_class",
+                    ],
+                    aliases=[
+                        "Location",
+                        "State",
+                        "County",
+                        "Risk tier",
+                        "Risk score",
+                        "Tree canopy",
+                        "Slope",
+                        "Land cover",
+                    ],
+                    labels=True,
+                    sticky=True,
+                ),
+            ).add_to(cluster)
             cluster.add_to(group)
             group.add_to(m)
 
@@ -2051,6 +2446,9 @@ class PipelineOrchestrator:
         # forcing the user to discover the hamburger button hides one
         # of the Phase 10 STOP-gate features.
         folium.LayerControl(collapsed=False).add_to(m)
+
+        if states or counties:
+            _RegionFilterControl(states, counties, tier_group_names).add_to(m)
 
         # The colour legend lives in the bottom-left so it doesn't
         # collide with the LayerControl on the top-right.
@@ -2094,10 +2492,14 @@ class PipelineOrchestrator:
             return scored
 
         budget = _MAP_MAX_POINTS
+        high_target = int(budget * _MAP_QUOTA_HIGH)
+        moderate_target = int(budget * _MAP_QUOTA_MODERATE)
+        # Compute Low as the remainder rather than ``int(budget * _MAP_QUOTA_LOW)``
+        # so that ``int(...)`` truncation can't slip a marker off the budget.
         targets = {
-            TIER_HIGH: int(budget * 0.40),
-            TIER_MODERATE: int(budget * 0.35),
-            TIER_LOW: budget - int(budget * 0.40) - int(budget * 0.35),
+            TIER_HIGH: high_target,
+            TIER_MODERATE: moderate_target,
+            TIER_LOW: budget - high_target - moderate_target,
         }
         # First pass: clamp each tier's target to what's actually
         # available, recording the unused budget.
@@ -2132,14 +2534,71 @@ class PipelineOrchestrator:
         )
 
     @staticmethod
-    def _marker_html(row: Any) -> str:
-        """Build the tooltip/popup HTML for a single marker.
+    def _dataframe_to_geojson(df: pd.DataFrame) -> dict[str, Any]:
+        """Convert scored rows to a GeoJSON FeatureCollection for Folium.
 
-        Format matches the Phase 10 STOP-gate field list: location_id,
-        state, county, risk_tier, risk_score, tcc_pct, slope_deg,
-        land_cover_class. NaN / None render as "—" so a reviewer sees
-        a placeholder rather than the JavaScript-y "NaN" or "null".
+        Each feature carries a ``county`` property (5-digit GEOID) so
+        the county-filter control can show/hide markers client-side.
         """
+        features: list[dict[str, Any]] = []
+        for row in df.itertuples(index=False):
+            county_val = getattr(row, "county", None)
+            county = (
+                ""
+                if county_val is None or (isinstance(county_val, float) and pd.isna(county_val))
+                else str(county_val)
+            )
+            risk_score = getattr(row, "risk_score", None)
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [
+                            float(row.longitude),
+                            float(row.latitude),
+                        ],
+                    },
+                    "properties": {
+                        "location_id": str(row.location_id),
+                        "state": (
+                            ""
+                            if pd.isna(getattr(row, "state", None))
+                            else str(row.state)
+                        ),
+                        "county": county,
+                        "risk_tier": str(row.risk_tier),
+                        "risk_score": (
+                            float(risk_score)
+                            if risk_score is not None
+                            and not (isinstance(risk_score, float) and pd.isna(risk_score))
+                            else None
+                        ),
+                        "tcc_pct": (
+                            int(row.tcc_pct)
+                            if getattr(row, "tcc_pct", None) is not None
+                            and not pd.isna(getattr(row, "tcc_pct", None))
+                            else None
+                        ),
+                        "slope_deg": (
+                            float(row.slope_deg)
+                            if getattr(row, "slope_deg", None) is not None
+                            and not pd.isna(getattr(row, "slope_deg", None))
+                            else None
+                        ),
+                        "land_cover_class": (
+                            ""
+                            if pd.isna(getattr(row, "land_cover_class", None))
+                            else str(row.land_cover_class)
+                        ),
+                    },
+                }
+            )
+        return {"type": "FeatureCollection", "features": features}
+
+    @staticmethod
+    def _marker_html_from_props(props: dict[str, Any]) -> str:
+        """Build tooltip HTML from a GeoJSON ``properties`` dict."""
 
         def _fmt(val: Any, kind: str = "raw") -> str:
             if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -2153,25 +2612,42 @@ class PipelineOrchestrator:
             return str(val)
 
         rows = [
-            ("Location", _fmt(getattr(row, "location_id", None))),
-            ("State", _fmt(getattr(row, "state", None))),
-            ("County", _fmt(getattr(row, "county", None))),
-            ("Risk tier", _fmt(getattr(row, "risk_tier", None))),
-            ("Risk score", _fmt(getattr(row, "risk_score", None), "score")),
-            ("Tree canopy", _fmt(getattr(row, "tcc_pct", None), "pct")),
-            ("Slope", _fmt(getattr(row, "slope_deg", None), "deg")),
-            ("Land cover", _fmt(getattr(row, "land_cover_class", None))),
+            ("Location", _fmt(props.get("location_id"))),
+            ("State", _fmt(props.get("state"))),
+            ("County", _fmt(props.get("county"))),
+            ("Risk tier", _fmt(props.get("risk_tier"))),
+            ("Risk score", _fmt(props.get("risk_score"), "score")),
+            ("Tree canopy", _fmt(props.get("tcc_pct"), "pct")),
+            ("Slope", _fmt(props.get("slope_deg"), "deg")),
+            ("Land cover", _fmt(props.get("land_cover_class"))),
         ]
-        # Class names instead of inline styles — the shared ``<style>``
-        # block (see ``_marker_style_block``) lives in the document
-        # head, so duplicating the CSS per marker would be pure waste
-        # at the 50k-marker cap.
         cells = "".join(
             f"<tr><td class='rmk-l'>{label}</td>"
             f"<td class='rmk-v'>{value}</td></tr>"
             for label, value in rows
         )
         return f"<div class='rmk'><table>{cells}</table></div>"
+
+    @staticmethod
+    def _marker_html(row: Any) -> str:
+        """Build the tooltip/popup HTML for a single marker.
+
+        Format matches the Phase 10 STOP-gate field list: location_id,
+        state, county, risk_tier, risk_score, tcc_pct, slope_deg,
+        land_cover_class. NaN / None render as "—" so a reviewer sees
+        a placeholder rather than the JavaScript-y "NaN" or "null".
+        """
+        props = {
+            "location_id": getattr(row, "location_id", None),
+            "state": getattr(row, "state", None),
+            "county": getattr(row, "county", None),
+            "risk_tier": getattr(row, "risk_tier", None),
+            "risk_score": getattr(row, "risk_score", None),
+            "tcc_pct": getattr(row, "tcc_pct", None),
+            "slope_deg": getattr(row, "slope_deg", None),
+            "land_cover_class": getattr(row, "land_cover_class", None),
+        }
+        return PipelineOrchestrator._marker_html_from_props(props)
 
     @staticmethod
     def _marker_style_block() -> str:

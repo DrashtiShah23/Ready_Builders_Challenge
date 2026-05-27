@@ -1,115 +1,260 @@
 # Data Sourcing
 
-Mapping every dataset used in this pipeline to a specific Starlink install-guide obstruction factor, with version pins for reproducibility.
+This document maps each dataset to an install guide obstruction factor and pins versions.
 
-## Dataset → Obstruction-factor mapping
+## Dataset to obstruction factor mapping
 
-| Dataset | Source | Install-guide obstruction factor | Why this dataset |
-|---|---|---|---|
-| NLCD 2021 Tree Canopy Cover (USGS / MRLC) | https://www.mrlc.gov/data | Tree branches (primary obstruction named in the install guide) | Continuous 0–100% canopy density at 30m, nationally consistent, version-pinned by year. The only nationally available dataset that gives a continuous canopy signal rather than a binary forest/non-forest classification. |
-| USGS 3DEP Elevation | https://www.usgs.gov/3d-elevation-program | Terrain blocking the 25° minimum elevation angle / 100–110° FOV cone | Only consistently national DEM at 10–30m resolution. Slope and aspect derived via Horn's method directly model how much sky a dish loses at each location. |
-| NLCD 2021 Land Cover (USGS / MRLC) | https://www.mrlc.gov/data | Structural-density context (developed codes) + cross-validation of TCC (forest codes) | Same dataset family as TCC: same CRS (EPSG:5070), same resolution (30m), same download. Zero additional infrastructure for a meaningful signal. |
+<table>
+  <tr>
+    <th>Dataset</th>
+    <th>Source</th>
+    <th>Install guide obstruction factor</th>
+    <th>Why this dataset</th>
+  </tr>
+  <tr>
+    <td>NLCD 2021 Tree Canopy Cover</td>
+    <td>https://www.mrlc.gov/data</td>
+    <td>Tree branches named as the primary obstruction</td>
+    <td>Continuous canopy density with national coverage and year pin</td>
+  </tr>
+  <tr>
+    <td>USGS 3DEP Elevation</td>
+    <td>https://www.usgs.gov/3d&#45;elevation&#45;program</td>
+    <td>Terrain blocking the 25 degree minimum elevation angle and the sky cone</td>
+    <td>National DEM that supports slope and aspect derivation</td>
+  </tr>
+  <tr>
+    <td>NLCD 2021 Land Cover</td>
+    <td>https://www.mrlc.gov/data</td>
+    <td>Structural density context plus cross validation of canopy</td>
+    <td>Same dataset family as canopy with aligned CRS and resolution</td>
+  </tr>
+</table>
 
 ## Version pins
 
-- NLCD TCC: coverage id `mrlc_download__nlcd_tcc_conus_2021_v2021-4` (pinned in `src/config.py:MRLC_TCC_COVERAGE_ID`)
-- NLCD Land Cover: coverage id `mrlc_download__NLCD_2021_Land_Cover_L48` (pinned in `src/config.py:MRLC_LANDCOVER_COVERAGE_ID`)
-- USGS 3DEP: 1 arc-second GeoTIFF tiles, requested via the TNM `bbox` filter. Tile-level URLs are not version-pinned by USGS — the downloader keeps the most-recent vintage per 1° quad and captures the resolved URLs in the JSONL run log under `DEM_BBOX_QUERY_OK` and `HTTP_DOWNLOAD_DONE` events.
+<table>
+  <tr>
+    <th>Dataset</th>
+    <th>Pin</th>
+    <th>Where it lives</th>
+  </tr>
+  <tr>
+    <td>NLCD canopy</td>
+    <td>Coverage id mrlc_download__nlcd_tcc_conus_2021_v2021&#45;4</td>
+    <td>src/config.py MRLC_TCC_COVERAGE_ID</td>
+  </tr>
+  <tr>
+    <td>NLCD land cover</td>
+    <td>Coverage id mrlc_download__NLCD_2021_Land_Cover_L48</td>
+    <td>src/config.py MRLC_LANDCOVER_COVERAGE_ID</td>
+  </tr>
+  <tr>
+    <td>USGS 3DEP</td>
+    <td>1 arc second GeoTIFF tiles requested via TNM bbox filter</td>
+    <td>Resolved URLs captured in JSONL events DEM_BBOX_QUERY_OK and HTTP_DOWNLOAD_DONE</td>
+  </tr>
+</table>
 
-## MRLC bulk zips → WCS (migrated May 2026)
+## MRLC bulk zips to WCS migration
 
-The downloader used to fetch the two NLCD layers as national zips from MRLC's S3 bucket:
+Implementation: src/data/downloader.py download_tcc and download_landcover.
 
-- `https://s3-us-west-2.amazonaws.com/mrlc/nlcd_tcc_conus_2021_v2021-4.zip`
-- `https://s3-us-west-2.amazonaws.com/mrlc/nlcd_land_cover_l48_2021_20230630.zip`
+The bulk zip path began returning HTTP 403 AccessDenied in May 2026.
+The downloader uses MRLC WCS at https://www.mrlc.gov/geoserver/mrlc_download/wcs.
 
-Both URLs began returning HTTP 403 `AccessDenied` in May 2026; the MRLC bucket policy now blocks anonymous bulk-zip downloads. The downloader was migrated to MRLC's WCS (OGC Web Coverage Service) endpoint at `https://www.mrlc.gov/geoserver/mrlc_download/wcs` — the same source rasters with the same provenance, served as queryable coverages instead of national zips.
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th>National zip former</th>
+    <th>WCS NC subset current</th>
+  </tr>
+  <tr>
+    <td>TCC download size</td>
+    <td>About 3 GB extracted</td>
+    <td>About 50 to 150 MB</td>
+  </tr>
+  <tr>
+    <td>Land cover download size</td>
+    <td>About 3 GB extracted</td>
+    <td>About 50 to 150 MB</td>
+  </tr>
+  <tr>
+    <td>Bytes used by NC only pipeline</td>
+    <td>About 0.4 percent</td>
+    <td>About 100 percent</td>
+  </tr>
+  <tr>
+    <td>Scope change to a different state</td>
+    <td>Requires the same large downloads again</td>
+    <td>Rerun downloader with new states</td>
+  </tr>
+</table>
 
-The migration is also an architectural win independent of the bucket lockdown. Concrete numbers for the NC use case:
+## TNM polyType to bbox migration
 
-| | National zip (former) | WCS NC subset (current) |
-|---|---|---|
-| TCC download size | ~3 GB extracted | ~50-150 MB |
-| Land Cover download size | ~3 GB extracted | ~50-150 MB |
-| Bytes used by the NC-only pipeline | ~0.4 % | ~100 % |
-| Re-pull required to scope to a different state | Yes (same 3 GB twice) | No (rerun with new `--states`) |
-| Failure mode if a single URL breaks | Whole pipeline blocked | Single coverage retried via OGC service |
+The TNM polyType state filter stopped working in May 2026.
+The downloader uses bbox and reads state bboxes from src/config.py STATE_BBOX_WGS84.
 
-WCS is also the OGC-standard interface MRLC's own viewer uses, so it's the least-likely-to-disappear path going forward. See `src/data/downloader.py` for the implementation and `AI_TOOLS.md` § "Phase 8 follow-up — MRLC source migration" for the decision log.
-
-## TNM `polyType=state` → `bbox` (migrated May 2026)
-
-The downloader used to query USGS TNM with `polyType=state&polyCode=<FIPS>`. That filter stopped working in May 2026 — `polyCode=37` (NC) returns ~200 tiles, all of them in Oregon/Idaho (lat 41-44, lon -117 to -119). Verified by probing several FIPS codes; the upstream filter is dead, not a code bug on our side.
-
-The downloader now uses TNM's `bbox=lon_min,lat_min,lon_max,lat_max` filter — the same query path TNM's own viewer uses internally. State-to-bbox mapping lives in `src/config.py:STATE_BBOX_WGS84`. NC's bbox is `(-84.32, 33.75, -75.46, 36.59)`, the same one the orchestrator's geographic-sanity validation check uses.
-
-TNM's bbox endpoint serves up to ``max`` items in a single page (default 50, capped server-side around the low hundreds). The full NC catalogue contains ~126 raw items (3+ vintages × ~38 land quads), so the default 50 was clipping the western mountain quads off the page. The downloader requests ``max=200`` (`config.TNM_PAGE_SIZE`), which captures the full NC catalogue, then dedupes by ``(round(min_lat), round(min_lon))`` keeping the latest-vintage tile per 1° quad. Server-side pagination via ``offset`` is currently flaky (``total=0`` after the first page), so the single-large-request approach is the path with the cleanest failure mode.
+<table>
+  <tr>
+    <th>Detail</th>
+    <th>Value</th>
+  </tr>
+  <tr>
+    <td>NC bbox used</td>
+    <td>(−84.32, 33.75, −75.46, 36.59) in lon lat order</td>
+  </tr>
+  <tr>
+    <td>Page size</td>
+    <td>max 200 via config.TNM_PAGE_SIZE</td>
+  </tr>
+  <tr>
+    <td>Dedupe</td>
+    <td>Latest vintage per 1 degree quad</td>
+  </tr>
+</table>
 
 ## CRS strategy
 
-All NLCD rasters are stored in **EPSG:5070** (Albers Equal Area for CONUS). Input locations arrive in **EPSG:4326** (WGS84 lat/lon). A single `pyproj.Transformer` instance is constructed once per process and reused for every sample, avoiding per-call transformer setup overhead.
+<table>
+  <tr>
+    <th>Layer</th>
+    <th>CRS</th>
+    <th>Why</th>
+  </tr>
+  <tr>
+    <td>NLCD rasters</td>
+    <td>EPSG:5070</td>
+    <td>Native CRS for CONUS rasters</td>
+  </tr>
+  <tr>
+    <td>Input locations</td>
+    <td>EPSG:4326</td>
+    <td>Standard lat lon input coordinates</td>
+  </tr>
+</table>
 
-## Known quality issues
+## Input data quality
 
-### Ingestion-level data quality flags
+### Ingestion level data quality flags
 
-The ingestion-agent log at the end of each run prints counts per reason code, plus the total valid-row percentage.
+<table>
+  <tr>
+    <th>Reason code</th>
+    <th>Meaning</th>
+  </tr>
+  <tr>
+    <td>NULL_COORDINATE</td>
+    <td>Latitude or longitude missing</td>
+  </tr>
+  <tr>
+    <td>OUT_OF_BOUNDS</td>
+    <td>Coordinate outside the CONUS bounding box in src/config.py</td>
+  </tr>
+  <tr>
+    <td>PARSE_ERROR</td>
+    <td>Non numeric coordinate or malformed row</td>
+  </tr>
+  <tr>
+    <td>DUPLICATE_DROPPED</td>
+    <td>Repeated location_id, first occurrence wins</td>
+  </tr>
+  <tr>
+    <td>INVALID_STATE</td>
+    <td>State field not in the US state list</td>
+  </tr>
+</table>
 
-- `NULL_COORDINATE` — latitude or longitude missing
-- `OUT_OF_BOUNDS` — coordinate outside the CONUS bounding box defined in `src/config.py`
-- `PARSE_ERROR` — non-numeric coordinate, malformed row
-- `DUPLICATE_DROPPED` — repeated `location_id`, first occurrence wins
-- `INVALID_STATE` — `state` field not in the US state list
+### geoid_cb column
 
-### NLCD TCC NoData on non-tree land cover classes (discovered May 2026)
+Implementation: src/agents/ingestion.py _derive_state_county_from_geoid.
 
-The first real-data pipeline run on 10,000 NC locations surfaced a **33.29% TCC-missing rate**, well above the 10% threshold that flips the validator's `missing_data_rate` check from `passed` to `warning`. Investigation confirmed this is **not** a raster coverage gap — it is NLCD TCC's documented behavior: TCC is only computed for pixels where tree canopy is a meaningful component of the land surface. The per-class missing rates from the 10k-NC sample show the pattern unambiguously:
+The CSV does not provide explicit state or county columns.
+It provides geoid_cb as a 15 digit Census Block GEOID.
 
-| NLCD code | Class | TCC-missing rate |
-|---|---|---:|
-| 11 | Open Water | 87.5% |
-| 21 | Developed, Open Space | 20.9% |
-| 22 | Developed, Low Intensity | 21.3% |
-| 23 | Developed, Medium Intensity | 50.9% |
-| 24 | Developed, High Intensity | 86.7% |
-| 31 | Barren Land | 86.7% |
-| 41/42/43 | Forest (Deciduous / Evergreen / Mixed) | 0–20.0% |
-| 52 | Shrub/Scrub | 33.1% |
-| 71 | Grassland/Herbaceous | 78.1% |
-| 81 | Pasture/Hay | 68.4% |
-| 82 | Cultivated Crops | 88.0% |
-| 90 | Woody Wetlands | 19.3% |
-| 95 | Emergent Herbaceous Wetlands | 71.4% |
+<table>
+  <tr>
+    <th>Derived field</th>
+    <th>Derived from geoid_cb</th>
+    <th>Meaning</th>
+  </tr>
+  <tr>
+    <td>state</td>
+    <td>Digits 1 to 2</td>
+    <td>State FIPS</td>
+  </tr>
+  <tr>
+    <td>county</td>
+    <td>Digits 1 to 5</td>
+    <td>County GEOID, state FIPS plus county FIPS</td>
+  </tr>
+</table>
 
-The signal: as urban density rises (21 → 24) or as the class becomes inherently non-tree (water, barren, crops, herbaceous), NoData rises with it. Forested classes (41/42/43) are near-complete, woody wetlands are near-complete, and developed open space — which routinely has scattered trees — is also near-complete. This is the expected behavior of any "tree canopy %" raster.
+Strict contract: geoid_cb must be exactly 15 numeric digits.
+Shorter values are rejected to avoid ambiguous leading zero loss.
+During the full pipeline run on 4.67M rows, 12 duplicate location_ids were found and dropped using first occurrence wins deduplication policy.
 
-Every null-TCC row in the 10k-NC run carried the `TCC_MISSING` env-fetch flag from the EnvironmentalAgent, confirming the value came back NoData from the raster rather than being silently dropped.
+## NLCD TCC NoData behavior on non tree classes
 
-**Scoring implication (real bias to be aware of, not a bug to fix yet).** `score_components` in `src/agents/scoring.py` treats `tcc_pct is None` as `tcc_score = 0.0` — the most-favorable bucket. A null-TCC row's composite is therefore capped at `0.0 × 0.50 + 1.0 × 0.30 + 1.0 × 0.20 = 0.50`, which is **below the 0.60 High threshold** under every other combination of inputs. Concretely from the same 10k-NC run:
+Implementation: src/tools/tcc.py fetch_tcc returns tcc missing True for NoData pixels.
 
-| Subset | Rows | High | Moderate | Low | High % |
-|---|---:|---:|---:|---:|---:|
-| Null TCC | 3,329 | 0 | 1 | 3,328 | 0.00% |
-| Non-null TCC | 6,671 | 584 | 3,438 | 2,649 | 8.75% |
-| All | 10,000 | 584 | 3,439 | 5,977 | 5.84% |
+The first pipeline run on 10,000 NC locations surfaced 33.29 percent TCC missing.
+Investigation confirmed this is NLCD TCC behavior, not a raster coverage gap.
 
-Restricting the High-share calculation to rows with TCC data gives **8.75% High**, vs **5.84%** across the full sample. The headline number is conservative by ~3 percentage points on a sample that is heavily Developed (coastal NC, ~62% developed codes), and would be even further understated on a sample with more Cultivated Crops or Pasture coverage.
+<table>
+  <tr>
+    <th>NLCD code</th>
+    <th>Class</th>
+    <th>TCC missing rate</th>
+  </tr>
+  <tr><td>11</td><td>Open Water</td><td>87.5 percent</td></tr>
+  <tr><td>21</td><td>Developed, Open Space</td><td>20.9 percent</td></tr>
+  <tr><td>22</td><td>Developed, Low Intensity</td><td>21.3 percent</td></tr>
+  <tr><td>23</td><td>Developed, Medium Intensity</td><td>50.9 percent</td></tr>
+  <tr><td>24</td><td>Developed, High Intensity</td><td>86.7 percent</td></tr>
+  <tr><td>31</td><td>Barren Land</td><td>86.7 percent</td></tr>
+  <tr><td>41 42 43</td><td>Forest classes</td><td>0 to 20.0 percent</td></tr>
+  <tr><td>52</td><td>Shrub Scrub</td><td>33.1 percent</td></tr>
+  <tr><td>71</td><td>Grassland Herbaceous</td><td>78.1 percent</td></tr>
+  <tr><td>81</td><td>Pasture Hay</td><td>68.4 percent</td></tr>
+  <tr><td>82</td><td>Cultivated Crops</td><td>88.0 percent</td></tr>
+  <tr><td>90</td><td>Woody Wetlands</td><td>19.3 percent</td></tr>
+  <tr><td>95</td><td>Emergent Herbaceous Wetlands</td><td>71.4 percent</td></tr>
+</table>
 
-Three reasons we are not fixing this in Phase 9:
-
-1. **Mapping `tcc_pct is None` → `_SCORE_LOW` is a defensible default** for non-tree land cover. A pixel classified as Open Water or Developed High Intensity genuinely has near-zero canopy obstruction, so giving it `tcc_score = 0` is closer to truth than refusing to score it.
-2. **The classes where TCC NoData is most concerning** — Pasture/Hay (81), Grassland (71), Emergent Wetlands (95), Cultivated Crops (82) — are already captured by the **land cover score** at 20% of the composite weight. Those classes map to `_SCORE_LOW` in the landcover bucket as well, so the composite is internally consistent: no canopy expected, no canopy scored, no landcover risk scored.
-3. **A future refinement (Phase 12 candidate)** is to re-normalise the weights when TCC is null: `composite = (terrain × 0.30 + landcover × 0.20) / 0.50` would lift a steep-and-forested null-TCC row to its proper High tier. This requires (a) cross-validating against ground-truth installs to verify that the lift improves operational decisions, and (b) extending the report to flag every "TCC-derived" tier separately so a broadband officer can see when a High classification rests on incomplete data.
-
-For now, every analysis report includes the per-signal missing rate table in its Data Quality Summary section, and the validator emits a `proceed_with_caveats` recommendation whenever any signal exceeds 10% missing — so the conservatism is surfaced, not hidden.
+The scoring uses tcc_pct is None as tcc_score 0.0.
+This conservatively caps the composite score below the High tier cutoff.
 
 ## What cannot be modeled with public data
 
-These factors materially affect real-world Starlink performance but cannot be captured by any nationally available public dataset. They are documented here so reviewers know what the pipeline is **not** claiming to model:
-
-- **Exact tree heights** — TCC measures canopy area %, not height. A 90% TCC pixel could be shrubs or 100 ft pines.
-- **Building heights** — no national dataset exists. OSM has footprints, not heights.
-- **Seasonal canopy variation** — NLCD TCC is a peak-summer 2021 snapshot; deciduous trees shed leaves in winter.
-- **Sub-30m obstructions** — a single tall tree on a property edge may not register in a 30m pixel.
-- **Microsite conditions** — rooftop access, mounting options, HOA restrictions, landlord permission.
-- **Temporary obstructions** — construction cranes, seasonal scaffolding, parked vehicles.
+<table>
+  <tr>
+    <th>Factor</th>
+    <th>Why it is not captured</th>
+  </tr>
+  <tr>
+    <td>Exact tree heights</td>
+    <td>TCC measures canopy area percent, not height</td>
+  </tr>
+  <tr>
+    <td>Building heights</td>
+    <td>No national public dataset exists at required resolution</td>
+  </tr>
+  <tr>
+    <td>Seasonal canopy variation</td>
+    <td>NLCD TCC is a 2021 peak summer snapshot</td>
+  </tr>
+  <tr>
+    <td>Sub 30 meter obstructions</td>
+    <td>Single trees can be invisible within a larger pixel</td>
+  </tr>
+  <tr>
+    <td>Microsite conditions</td>
+    <td>Roof access and permissions require site assessment</td>
+  </tr>
+  <tr>
+    <td>Temporary obstructions</td>
+    <td>Cranes and seasonal objects change rapidly</td>
+  </tr>
+</table>

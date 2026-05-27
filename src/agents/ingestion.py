@@ -18,8 +18,12 @@ Design decisions
   are dropped after the first valid record — they cannot represent the
   same point twice in the same run.
 - **Batched output**: the agent yields lists of ``ValidatedLocation`` of
-  size ``CLAUDE_BATCH_SIZE`` to keep memory pressure low on the next
-  stage. Each batch has a stable, monotonic ``batch_id`` (``batch-000000``,
+  size ``RASTER_BATCH_SIZE`` (default 50,000) to keep memory pressure
+  low on the next stage. The Phase 7 redesign removed the legacy
+  ``CLAUDE_BATCH_SIZE`` constant — Claude no longer reasons per batch
+  of locations, so the batch sizing concern is purely about raster I/O
+  efficiency, which is what ``RASTER_BATCH_SIZE`` already governs.
+  Each batch has a stable, monotonic ``batch_id`` (``batch-000000``,
   ``batch-000001``, …) so a single failing record can be traced end-to-end
   through the log.
 
@@ -143,6 +147,15 @@ class IngestionAgent:
     """
 
     def __init__(self, logger: Optional[PipelineLogger] = None) -> None:
+        """Initialise per-run state.
+
+        ``logger`` is optional so the agent can be exercised standalone
+        from a REPL / notebook without first instantiating a
+        :class:`PipelineLogger` — a synthetic ingest-only logger is
+        created in that case. ``stats``, ``seen_ids``, ``total_rows``,
+        ``valid_count`` accumulate during :meth:`run` and are stable to
+        read after iteration finishes.
+        """
         self.logger = logger or PipelineLogger(
             run_id=f"ingest-{uuid.uuid4().hex[:8]}"
         )
@@ -287,7 +300,10 @@ class IngestionAgent:
             Path to the input CSV.
         batch_size:
             Number of validated rows per emitted batch. Defaults to
-            ``config.CLAUDE_BATCH_SIZE``.
+            ``config.RASTER_BATCH_SIZE``. The orchestrator always
+            passes this explicitly; the default exists so the agent
+            can be exercised standalone from the REPL / a notebook
+            without having to look up the constant.
 
         Yields
         ------
@@ -311,7 +327,7 @@ class IngestionAgent:
             )
             raise FileNotFoundError(f"Locations CSV not found: {csv_path}")
 
-        size = batch_size if batch_size is not None else config.CLAUDE_BATCH_SIZE
+        size = batch_size if batch_size is not None else config.RASTER_BATCH_SIZE
         self.logger.info(
             stage="ingestion",
             event_type="INGESTION_START",

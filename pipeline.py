@@ -23,7 +23,8 @@ Design notes
 ------------
 This file is intentionally thin: every meaningful piece of behavior lives in
 ``src/agents/orchestrator.py``. Phase 7's redesign moved the agent loop down
-into the orchestrator (single Claude call, five pipeline-level tools), so
+into the orchestrator (one orchestration session of ~6 turns, five
+pipeline-level tools), so
 ``pipeline.py``'s only jobs are:
 
 * parse CLI args,
@@ -42,12 +43,16 @@ handler that emits a ``PIPELINE_INTERRUPTED`` log event before exit.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import signal
+import subprocess
 import sys
 import time
 import uuid
 from typing import Any, Optional
+
+import httpx
 
 from src import config
 from src.agents.orchestrator import PipelineOrchestrator, estimate_cost_usd
@@ -262,6 +267,13 @@ _MODES = ("batch", "interactive", "dry-run")
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Build the argparse Namespace for the pipeline CLI.
+
+    ``argv`` defaults to ``sys.argv[1:]`` when called from a terminal;
+    tests pass an explicit list to drive the parser deterministically.
+    The returned Namespace holds every flag described in the module
+    docstring.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "LEO satellite coverage risk pipeline. Batch mode runs the "
@@ -327,6 +339,35 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--lat", type=float, help="Latitude for interactive mode.")
     parser.add_argument("--lon", type=float, help="Longitude for interactive mode.")
+    parser.add_argument(
+        "--address",
+        type=str,
+        default=None,
+        help="Interactive mode only: resolve an address to coordinates via Nominatim.",
+    )
+    parser.add_argument(
+        "--county",
+        type=str,
+        default=None,
+        help="Interactive mode only: assess a county by GEOID or county name.",
+    )
+    parser.add_argument(
+        "--buffer",
+        type=float,
+        default=None,
+        help=(
+            "Interactive mode only: search radius in metres for better "
+            f"alternatives (default {config.INTERACTIVE_BUFFER_METERS:.0f} m)."
+        ),
+    )
+    parser.add_argument(
+        "--regenerate-map",
+        action="store_true",
+        help=(
+            "Skip all pipeline steps and re-run report/map generation using the "
+            "existing scored parquet (data/processed/scored_locations.parquet)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -359,11 +400,116 @@ def _require_api_key(allow_missing: bool) -> Optional[str]:
     return None
 
 
+def _raster_files_present() -> bool:
+    """Return True if required raster artifacts exist on disk."""
+    has_tcc = any(config.TCC_DIR.glob("*.tif")) or any(config.TCC_DIR.glob("*.tiff")) or any(
+        config.TCC_DIR.glob("*.img")
+    )
+    has_lc = any(config.LC_DIR.glob("*.tif")) or any(config.LC_DIR.glob("*.tiff")) or any(
+        config.LC_DIR.glob("*.img")
+    )
+    has_slope = config.SLOPE_RASTER_PATH.exists()
+    return bool(has_tcc and has_lc and has_slope)
+
+
+def _states_in_csv(csv_path: str, *, max_rows: int = 20_000) -> list[str]:
+    """Best effort discovery of states present in the input CSV."""
+    states: set[str] = set()
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames is None:
+                return ["NC"]
+            fieldnames = {f.strip() for f in reader.fieldnames if f}
+            has_state = "state" in fieldnames
+            has_geoid = "geoid_cb" in fieldnames
+            for i, row in enumerate(reader):
+                if i >= max_rows:
+                    break
+                if has_state:
+                    s = (row.get("state") or "").strip().upper()
+                    if s:
+                        states.add(s)
+                        continue
+                if has_geoid:
+                    g = (row.get("geoid_cb") or "").strip()
+                    if len(g) == 15 and g.isdigit():
+                        abbr = config.STATE_FIPS_TO_ABBR.get(g[:2])
+                        if abbr:
+                            states.add(abbr)
+    except Exception:
+        return ["NC"]
+
+    return sorted(states) if states else ["NC"]
+
+
+def _download_required_rasters(states: list[str]) -> int:
+    """Invoke the downloader CLI for the given states."""
+    cmd = [sys.executable, "-m", "src.data.downloader", "--states", *states]
+    return subprocess.call(cmd)
+
+
+def _ensure_rasters(csv_path: str) -> bool:
+    """Ensure rasters exist, optionally downloading them."""
+    if _raster_files_present():
+        return True
+
+    answer = input(
+        "Required rasters not found. Download now? This will take approximately 5 minutes. (yes/no) "
+    ).strip().lower()
+    if answer in {"y", "yes"}:
+        states = _states_in_csv(csv_path)
+        rc = _download_required_rasters(states)
+        if rc != 0:
+            print("ERROR: downloader failed.", file=sys.stderr)
+            return False
+        return _raster_files_present()
+
+    print(
+        "Raster files not found. Run: python -m src.data.downloader --states NC",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _geocode_address(address: str) -> Optional[tuple[float, float]]:
+    """Resolve an address to (lat, lon) using Nominatim."""
+    if not address.strip():
+        return None
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": address, "format": "json", "limit": 1}
+    headers = {
+        "User-Agent": "leo-satellite-coverage-risk/1.0 (educational challenge submission)",
+    }
+    try:
+        resp = httpx.get(url, params=params, headers=headers, timeout=20.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return None
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        return lat, lon
+    except Exception:
+        return None
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entrypoint — parse args, dispatch into batch / interactive / dry-run.
+
+    Returns an integer exit code (``0`` success, ``1`` dry-run failure,
+    ``2`` invalid args / missing API key, ``130`` ``SIGINT``). The
+    function is testable: pass an explicit ``argv`` list to bypass
+    ``sys.argv``. The module's ``if __name__ == "__main__"`` block
+    wraps the result in ``SystemExit`` for POSIX-compliant exit
+    propagation.
+    """
     args = _parse_args(argv)
     mode = _resolve_mode(args)
 
-    api_key = _require_api_key(allow_missing=(mode == "dry-run"))
+    api_key = _require_api_key(
+        allow_missing=(mode == "dry-run" or args.regenerate_map or args.county is not None)
+    )
     if api_key is None:
         return 2
 
@@ -379,6 +525,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     orchestrator.on_tool_end = _on_tool_end
 
     try:
+        if args.regenerate_map:
+            scored_path = config.DATA_DIR / "processed" / "scored_locations.parquet"
+            if not scored_path.exists():
+                print(
+                    f"ERROR: scored parquet not found at {scored_path}. "
+                    "Run the full pipeline first.",
+                    file=sys.stderr,
+                )
+                return 2
+            validation = orchestrator._run_validate_results(str(scored_path))
+            result = orchestrator._run_generate_report(
+                scored_locations_path=str(scored_path),
+                validation_report=validation,
+            )
+            print(json.dumps(result, indent=2, default=str))
+            return 0
+
         if mode == "dry-run":
             result = _run_dry(orchestrator, args.csv, sample_size=100)
             print(
@@ -388,17 +551,45 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0 if result["status"] == "dry_run_ok" else 1
 
         if mode == "interactive":
-            if args.lat is None or args.lon is None:
+            if args.county:
+                result = orchestrator.run_interactive_county(args.county)
+                print(json.dumps(result, indent=2, default=str))
+                return 0
+
+            if not _ensure_rasters(args.csv):
+                return 2
+
+            lat = args.lat
+            lon = args.lon
+            if (lat is None or lon is None) and args.address:
+                resolved = _geocode_address(args.address)
+                if resolved is None:
+                    print(
+                        "ERROR: address geocoding failed. Try a more specific address.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                lat, lon = resolved
+                print(f"Resolved coordinates: lat={lat:.6f}, lon={lon:.6f}", flush=True)
+
+            if lat is None or lon is None:
                 print(
-                    "ERROR: interactive mode requires --lat and --lon.",
+                    "ERROR: interactive mode requires --lat and --lon, or --address, or --county.",
                     file=sys.stderr,
                 )
                 return 2
-            result = orchestrator.run_interactive(args.lat, args.lon)
+
+            result = orchestrator.run_interactive(
+                lat,
+                lon,
+                buffer_meters=args.buffer,
+            )
             print(json.dumps(result, indent=2, default=str))
             return 0
 
         # mode == "batch"
+        if not _ensure_rasters(args.csv):
+            return 2
         sample_size = (
             args.sample if args.sample is not None else config.DEMO_SAMPLE_SIZE
         )
