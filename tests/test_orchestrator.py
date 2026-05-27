@@ -1093,3 +1093,506 @@ class TestToolHooks:
 
         # First tool's hook sees response 1's tokens; second tool's sees response 2's.
         assert ends == [("ingest_locations", 300, 40), ("score_risk", 170, 25)]
+
+
+# ===========================================================================
+# Phase 9 — generate_report
+# ===========================================================================
+
+
+def _scored_rows_for_report(
+    n: int,
+    state: str,
+    county: str,
+    tier: str,
+    location_id_prefix: str,
+) -> list[dict[str, Any]]:
+    """Synthesise ``ScoredLocation``-shaped rows for a single tier+county.
+
+    Tests in this section build a small set of (state, county, tier)
+    cells so the partition store has enough rows for ``min_locations=25``
+    in ``get_top_at_risk_counties`` to surface every county the test cares
+    about.
+    """
+    tier_score_map = {TIER_HIGH: 0.85, TIER_MODERATE: 0.45, TIER_LOW: 0.15}
+    return [
+        {
+            "location_id": f"{location_id_prefix}-{i}",
+            "latitude": 35.5 + (i * 0.0001),
+            "longitude": -80.0 - (i * 0.0001),
+            "state": state,
+            "county": county,
+            "tcc_pct": 60 if tier == TIER_HIGH else (30 if tier == TIER_MODERATE else 5),
+            "slope_deg": 25.0 if tier == TIER_HIGH else 5.0,
+            "aspect_deg": 180.0,
+            "land_cover_code": 42 if tier == TIER_HIGH else 81,
+            "land_cover_class": "Evergreen Forest" if tier == TIER_HIGH else "Cultivated Crops",
+            "risk_score": tier_score_map.get(tier, 0.15),
+            "risk_tier": tier,
+            "tcc_score": 1.0 if tier == TIER_HIGH else 0.0,
+            "terrain_score": 1.0 if tier == TIER_HIGH else 0.0,
+            "landcover_score": 1.0 if tier == TIER_HIGH else 0.0,
+            "all_flags": [],
+            "batch_id": "batch-000000",
+        }
+        for i in range(n)
+    ]
+
+
+def _populate_report_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[str, Path, Path]:
+    """Wire up a tmp store + outputs dir, write a deterministic scored
+    dataset (3 NC counties × multiple tiers), and return paths the
+    report test can use.
+
+    Returns
+    -------
+    (scored_locations_path, scored_dir, outputs_dir)
+    """
+    # The DuckDB queries read from ``config.SCORED_DIR`` via store.* — so
+    # we patch it to a fresh tmp dir per test to avoid cross-pollination.
+    scored_dir = tmp_path / "scored_store"
+    scored_dir.mkdir()
+    outputs_dir = tmp_path / "outputs"
+    outputs_dir.mkdir()
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    monkeypatch.setattr(orch_mod.config, "SCORED_DIR", scored_dir)
+    monkeypatch.setattr(orch_mod.config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(orch_mod, "_OUTPUTS_DIR", outputs_dir)
+    monkeypatch.setattr(orch_mod, "_REPORT_MD", outputs_dir / "analysis_report.md")
+    monkeypatch.setattr(orch_mod, "_MAP_HTML", outputs_dir / "risk_map.html")
+    monkeypatch.setattr(
+        orch_mod,
+        "_STATE_SUMMARY_PARQUET",
+        scored_dir / "risk_summary_by_state.parquet",
+    )
+    monkeypatch.setattr(
+        orch_mod,
+        "_COUNTY_SUMMARY_PARQUET",
+        scored_dir / "risk_summary_by_county.parquet",
+    )
+
+    # Deterministic cell counts so the top-counties query returns
+    # predictable ordering:
+    #   - Asheville: 40 High + 10 Low  → 80% High share
+    #   - Charlotte: 10 High + 20 Mod + 20 Low → 20% High share
+    #   - Raleigh:    5 High + 15 Mod + 30 Low → 10% High share
+    rows: list[dict[str, Any]] = []
+    rows.extend(_scored_rows_for_report(40, "NC", "Asheville", TIER_HIGH, "ash-h"))
+    rows.extend(_scored_rows_for_report(10, "NC", "Asheville", TIER_LOW, "ash-l"))
+    rows.extend(_scored_rows_for_report(10, "NC", "Charlotte", TIER_HIGH, "chr-h"))
+    rows.extend(_scored_rows_for_report(20, "NC", "Charlotte", TIER_MODERATE, "chr-m"))
+    rows.extend(_scored_rows_for_report(20, "NC", "Charlotte", TIER_LOW, "chr-l"))
+    rows.extend(_scored_rows_for_report(5, "NC", "Raleigh", TIER_HIGH, "ral-h"))
+    rows.extend(_scored_rows_for_report(15, "NC", "Raleigh", TIER_MODERATE, "ral-m"))
+    rows.extend(_scored_rows_for_report(30, "NC", "Raleigh", TIER_LOW, "ral-l"))
+
+    df = pd.DataFrame(rows)
+    # Write the single-file intermediate (the path Claude threads through)
+    # and populate the Hive-partitioned store the DuckDB queries read.
+    scored_path = processed_dir / "scored.parquet"
+    df.to_parquet(scored_path, index=False)
+    orch_mod.store.write_scored_locations(df, scored_dir=scored_dir)
+    return str(scored_path), scored_dir, outputs_dir
+
+
+class TestRemmemberSummary:
+    """Every ``_run_*`` handler must stash its return value on
+    ``self._tool_summaries`` so generate_report can read upstream
+    summaries without re-doing their work.
+    """
+
+    def test_ingest_summary_is_remembered(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        summary = {"status": "ok", "valid_rows": 3}
+        returned = orch._remember_summary("ingest_locations", summary)
+        assert returned is summary
+        assert orch._tool_summaries["ingest_locations"] is summary
+
+    def test_run_resets_tool_summary_cache(
+        self, orch: PipelineOrchestrator
+    ) -> None:
+        """Back-to-back ``run`` calls must not leak summaries from a prior
+        run into a new one — the cache is reset on entry."""
+        orch._tool_summaries = {"ingest_locations": {"status": "leftover"}}
+        orch.client.messages.create = MagicMock(
+            return_value=_response("end_turn", [_text_block("done")])
+        )
+        orch.run("ignored.csv", sample_size=None)
+        assert orch._tool_summaries == {}
+
+
+class TestGenerateReport:
+    """End-to-end ``_run_generate_report`` behavior — markdown contents,
+    DuckDB-backed aggregations, parquet summaries, and key_findings.
+    """
+
+    def test_outputs_dict_points_at_real_files(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        validation_report = {
+            "status": "passed",
+            "checks": {},
+            "total_warnings": 0,
+            "recommendation": "proceed",
+            "notes": "",
+        }
+        result = orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report=validation_report,
+        )
+
+        assert result["status"] == "ok"
+        outputs = result["outputs"]
+        assert Path(outputs["report"]).exists()
+        assert Path(outputs["state_summary"]).exists()
+        assert Path(outputs["county_summary"]).exists()
+        # Map render may fail in a headless test env — only assert non-empty
+        # when set, never that it had to render.
+        if outputs["map"]:
+            assert Path(outputs["map"]).exists()
+
+    def test_key_findings_match_partition_store(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        validation_report = {"status": "passed", "recommendation": "proceed"}
+        result = orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report=validation_report,
+        )
+        kf = result["key_findings"]
+        # 40 + 10 + 10 + 20 + 20 + 5 + 15 + 30 = 150 total locations.
+        assert kf["total_locations_analyzed"] == 150
+        # High = 40 + 10 + 5 = 55  →  55 / 150 ≈ 0.3667
+        assert kf["high_risk_pct"] == pytest.approx(55 / 150, rel=1e-3)
+        # Asheville is highest-High share (80%) and clears the 25-loc floor.
+        assert kf["top_at_risk_county"] == "Asheville"
+        assert kf["state"] == "NC"
+
+    def test_markdown_has_all_required_sections(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The Phase 9 STOP gate requires every named section to be
+        present in the generated markdown."""
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        validation_report = {
+            "status": "passed",
+            "checks": {"distribution_sanity": {"passed": True}},
+            "total_warnings": 0,
+            "recommendation": "proceed",
+            "notes": "",
+        }
+        # Pre-seed an ingest summary so the Data Quality section has real
+        # numbers — the generate_report tool reads from _tool_summaries.
+        orch._tool_summaries["ingest_locations"] = {
+            "status": "ok",
+            "total_rows": 200,
+            "valid_rows": 150,
+            "dropped_rows": 50,
+            "valid_pct": 0.75,
+            "drop_breakdown": {
+                "NULL_COORDINATE": 30,
+                "OUT_OF_BOUNDS": 20,
+                "INVALID_STATE": 0,
+            },
+            "state_distribution": {"NC": 150},
+        }
+        orch._tool_summaries["sample_environment"] = {
+            "status": "ok",
+            "total_locations": 150,
+            "enriched_locations": 148,
+            "missing_rates": {
+                "tcc_missing_pct": 0.01,
+                "slope_missing_pct": 0.02,
+                "landcover_missing_pct": 0.005,
+                "elevation_missing_pct": 0.0,
+            },
+        }
+        orch._tool_summaries["score_risk"] = {
+            "status": "ok",
+            "mean_composite_score": 0.42,
+        }
+
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report=validation_report,
+        )
+        report = (outputs_dir / "analysis_report.md").read_text()
+        for header in (
+            "# LEO Satellite Coverage Risk — Analysis Report",
+            "## Executive Summary",
+            "## Risk Distribution",
+            "## State-Level Breakdown",
+            "## Top 10 At-Risk Counties",
+            "## Data Quality Summary",
+            "## Methodology",
+            "## Known Limitations",
+            "## Generated Artifacts",
+        ):
+            assert header in report, f"missing section: {header}"
+
+    def test_executive_summary_uses_prescribed_opening(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The build plan requires the exec summary to open with the
+        specific sentence pattern from the Phase 9 spec."""
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        validation_report = {"status": "passed", "recommendation": "proceed"}
+        orch._tool_summaries["ingest_locations"] = {
+            "state_distribution": {"NC": 150}
+        }
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report=validation_report,
+        )
+        report = (outputs_dir / "analysis_report.md").read_text()
+        # Spec wording: "Of the [N] locations committed for LEO satellite
+        # service, approximately [X]% face elevated obstruction risk..."
+        assert "locations committed for LEO satellite" in report
+        assert "face elevated obstruction risk" in report
+        # The region phrase should name the single state observed in the
+        # ingest summary so the prose reads naturally.
+        assert "in NC" in report
+
+    def test_risk_distribution_table_counts_all_tiers(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report={"status": "passed", "recommendation": "proceed"},
+        )
+        report = (outputs_dir / "analysis_report.md").read_text()
+        # Every real tier shows up in the risk distribution table.
+        for tier in (TIER_HIGH, TIER_MODERATE, TIER_LOW):
+            assert f"| {tier} |" in report
+        # The total row mirrors the dataset size (150 rows).
+        assert "| **Total** | **150** | **100.00%** |" in report
+
+    def test_top_counties_table_orders_by_high_share(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report={"status": "passed", "recommendation": "proceed"},
+        )
+        report = (outputs_dir / "analysis_report.md").read_text()
+        # The three NC counties should appear in descending High-share
+        # order: Asheville (80%) → Charlotte (20%) → Raleigh (10%).
+        ash_idx = report.find("Asheville")
+        chr_idx = report.find("Charlotte")
+        ral_idx = report.find("Raleigh")
+        assert -1 < ash_idx < chr_idx < ral_idx
+        # The leading county's high share is rendered as "80.00%" in
+        # the same row.
+        assert "Asheville" in report
+        assert "80.00%" in report
+
+    def test_methodology_section_pins_weights_and_dataset_versions(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report={"status": "passed", "recommendation": "proceed"},
+        )
+        report = (outputs_dir / "analysis_report.md").read_text()
+        # The weights from config must appear verbatim in the formula.
+        assert f"× {orch_mod.config.TCC_WEIGHT:.2f}" in report
+        assert f"× {orch_mod.config.TERRAIN_WEIGHT:.2f}" in report
+        assert f"× {orch_mod.config.LANDCOVER_WEIGHT:.2f}" in report
+        # And the dataset version pins.
+        assert orch_mod.config.MRLC_TCC_COVERAGE_ID in report
+        assert orch_mod.config.MRLC_LANDCOVER_COVERAGE_ID in report
+        assert "USGS 3DEP" in report
+
+    def test_data_quality_section_lists_drop_reasons(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        orch._tool_summaries["ingest_locations"] = {
+            "status": "ok",
+            "total_rows": 200,
+            "valid_rows": 150,
+            "dropped_rows": 50,
+            "valid_pct": 0.75,
+            "drop_breakdown": {
+                "NULL_COORDINATE": 30,
+                "OUT_OF_BOUNDS": 20,
+                "INVALID_STATE": 0,
+            },
+            "state_distribution": {"NC": 150},
+        }
+        orch._tool_summaries["sample_environment"] = {
+            "total_locations": 150,
+            "enriched_locations": 148,
+            "missing_rates": {
+                "tcc_missing_pct": 0.01,
+                "slope_missing_pct": 0.02,
+                "landcover_missing_pct": 0.005,
+                "elevation_missing_pct": 0.0,
+            },
+        }
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report={"status": "passed", "recommendation": "proceed"},
+        )
+        report = (outputs_dir / "analysis_report.md").read_text()
+        # Non-zero exclusions show up; zero-counts are suppressed to keep
+        # the report scannable.
+        assert "`NULL_COORDINATE`" in report
+        assert "| 30 |" in report
+        assert "`OUT_OF_BOUNDS`" in report
+        assert "| 20 |" in report
+        assert "`INVALID_STATE`" not in report
+        # The env-coverage table is also rendered.
+        assert "Tree canopy cover (TCC)" in report
+        assert "Terrain slope" in report
+
+    def test_empty_dataset_returns_error_status(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An empty scored parquet should short-circuit with status=error
+        — no markdown is written and the caller (Claude) sees the failure."""
+        scored_dir = tmp_path / "scored"
+        scored_dir.mkdir()
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        empty_path = tmp_path / "empty.parquet"
+        pd.DataFrame(
+            columns=[
+                "location_id",
+                "latitude",
+                "longitude",
+                "state",
+                "county",
+                "risk_score",
+                "risk_tier",
+            ]
+        ).to_parquet(empty_path, index=False)
+        monkeypatch.setattr(orch_mod.config, "SCORED_DIR", scored_dir)
+        monkeypatch.setattr(orch_mod, "_OUTPUTS_DIR", outputs_dir)
+        monkeypatch.setattr(
+            orch_mod, "_REPORT_MD", outputs_dir / "analysis_report.md"
+        )
+
+        result = orch._run_generate_report(
+            scored_locations_path=str(empty_path),
+            validation_report={"status": "passed"},
+        )
+        assert result["status"] == "error"
+        assert not (outputs_dir / "analysis_report.md").exists()
+        # Even on the error path the summary is remembered so a caller
+        # reasoning over ``_tool_summaries`` sees the failure.
+        assert orch._tool_summaries["generate_report"]["status"] == "error"
+
+    def test_map_render_failure_does_not_break_report(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        logger: _CaptureLogger,
+    ) -> None:
+        """A folium failure must be logged but never crash the tool —
+        the markdown + parquet summaries are the primary deliverables."""
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+
+        with patch.object(
+            orch, "_render_map", side_effect=RuntimeError("synthetic")
+        ):
+            result = orch._run_generate_report(
+                scored_locations_path=scored_path,
+                validation_report={"status": "passed"},
+            )
+        assert result["status"] == "ok"
+        assert result["outputs"]["map"] == ""
+        # The failure was logged with the structured event type.
+        failures = [
+            e for e in logger.events if e["event_type"] == "MAP_RENDER_FAILED"
+        ]
+        assert len(failures) == 1
+
+    def test_summary_parquets_match_duckdb_aggregations(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The on-disk per-state and per-county summary parquets must be
+        byte-for-byte the DuckDB aggregation results — the report's
+        numbers and the parquet's numbers are guaranteed to agree."""
+        scored_path, scored_dir, outputs_dir = _populate_report_fixture(
+            tmp_path, monkeypatch
+        )
+        orch._run_generate_report(
+            scored_locations_path=scored_path,
+            validation_report={"status": "passed"},
+        )
+
+        on_disk_state = pd.read_parquet(
+            scored_dir / "risk_summary_by_state.parquet"
+        )
+        ducked_state = orch_mod.store.get_state_breakdown(
+            scored_dir=scored_dir
+        )
+        pd.testing.assert_frame_equal(on_disk_state, ducked_state)
+
+        on_disk_county = pd.read_parquet(
+            scored_dir / "risk_summary_by_county.parquet"
+        )
+        ducked_county = orch_mod.store.get_county_breakdown(
+            scored_dir=scored_dir
+        )
+        pd.testing.assert_frame_equal(on_disk_county, ducked_county)

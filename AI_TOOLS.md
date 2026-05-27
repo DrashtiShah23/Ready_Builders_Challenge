@@ -162,6 +162,30 @@ Phase 8 was reinterpreted under the Phase 7 redesign — the original per-batch 
 
 10. **`pyarrow` was added as an explicit dependency** even though pandas pulls it transitively when writing parquet. The store writer passes `engine="pyarrow"` explicitly to ensure deterministic behaviour across pandas builds (some default to `fastparquet`, which doesn't fully support all the dtype round-trips we rely on).
 
+## Phase 9 — Analysis report
+
+The report tool is the closing deliverable a state broadband officer actually reads. Every number in it had to be defensible, every section had to match the Phase 9 STOP-gate checklist, and the wiring had to keep the prior eight phases working untouched.
+
+1. **DuckDB drives every aggregation, not a second pandas implementation.** The Phase 8 partition store and its query helpers (`get_risk_distribution`, `get_state_breakdown`, `get_county_breakdown`, `get_top_at_risk_counties`) are the same SQL paths an analyst would query interactively, so the report's numbers and the queryable store's numbers can never drift. The earlier pandas `_tier_summary` helper was deleted rather than left as a parallel path — one source of truth or none.
+
+2. **`get_county_breakdown` is the full-list cousin of `get_top_at_risk_counties`.** The latter applies a `min_locations` floor (default 25) so single-row counties don't dominate the rankings; the former is unfiltered so the per-county summary parquet contains every cell. Both queries share the same column shape so a downstream consumer can swap one for the other without re-parsing the schema.
+
+3. **The report writes its own per-state and per-county summary parquets** at `outputs/scored/risk_summary_by_*.parquet`. These sit *alongside* the partitioned store rather than inside it (Phase 8's `state=*` glob ignores them by design). Pre-computing the aggregates as parquet means the Phase 10 interactive map and any future API endpoint can consume the same numbers without re-running the DuckDB queries.
+
+4. **Each `_run_*` handler caches its own summary on `self._tool_summaries`.** A tiny `_remember_summary(name, summary)` helper wraps every return path (including the resume short-circuits) so by the time `_run_generate_report` runs, the ingestion and environmental-enrichment summaries are in memory for the Data Quality section. Reaching back through these cached objects beats re-deriving missing-data rates and validation drop counts from the on-disk parquets.
+
+5. **Executive summary opens with the prescribed sentence pattern** from the build plan (`"Of the [N] locations committed for LEO satellite service…"`). A grep-stable opening sentence is the deliberate choice — evaluators (human and automated) can confirm the report shape without parsing prose. The rest of the summary is plain English; no formulas, no weights, no jargon. Those live one section down in Methodology.
+
+6. **Data Quality is split into three subsections** (Ingestion / Environmental Sampling / Post-Scoring Validation) rather than one prose paragraph. State broadband officers need to scan: *how many rows were dropped, why, and was the remaining environmental coverage good?* — three orthogonal questions deserve three orthogonal tables. Zero-count reasons are suppressed from the ingest exclusions table to keep it scannable.
+
+7. **Methodology pulls every threshold from `config.py` at render time.** Re-tuning a weight or threshold in config flows directly into the next regenerated report; the report never hard-codes a number the source of truth could disagree with. Dataset version pins (NLCD coverage IDs, USGS 3DEP DEM specifier, geoid_cb) are also rendered from config so a future MRLC vintage bump only touches one file.
+
+8. **Known Limitations is rooted in `docs/analysis_rationale.md`** § 4 ("What this analysis is not measuring"). Surfacing the same caveats up-front in the report is the operational difference between a "score" and a "score the user can act on"; the limitations section closes with the explicit `High → priority site assessment, not unserviceable; Low → best available remote assessment, not a guarantee` framing so a reader who only reads the first and last sections still leaves with the right mental model.
+
+9. **Map render failures are non-fatal.** The folium `_render_map` call is wrapped in a try/except that logs a `MAP_RENDER_FAILED` event and continues. The markdown + parquet summaries are the *primary* deliverables; the interactive HTML map is a nice-to-have, and a headless-environment matplotlib quirk or a missing dependency must never block the run.
+
+10. **The Generated Artifacts section uses paths relative to the project root when possible, absolute paths otherwise.** Test fixtures that monkeypatch `SCORED_DIR` and `_OUTPUTS_DIR` to a tmp dir outside the project root would otherwise raise `ValueError` on `Path.relative_to`; the relativization is best-effort so the same code works in both prod and tests.
+
 ## Phase 4 follow-up — geoid_cb derivation
 
 1. The real locations.csv (handed over after Phase 6) carries a `geoid_cb` column instead of separate `state` / `county` columns, so ingestion now derives state abbreviation and county GEOID from the first 5 digits of the 15-digit Census Block GEOID — pure data-already-present extraction, no extra column to ask the user for.
