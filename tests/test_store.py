@@ -247,6 +247,48 @@ class TestQueries:
         # Ordering: highest high_pct first.
         assert br.iloc[0]["state"] == "NC"
 
+    def test_get_county_breakdown_returns_every_county(
+        self, populated_store: Path
+    ) -> None:
+        """Unlike ``get_top_at_risk_counties``, ``get_county_breakdown``
+        is the full-list cousin — no ``LIMIT``, no ``min_locations``
+        floor. Tiny counties show up alongside large ones."""
+        # Add a tiny 2-row county that the top-N query would suppress.
+        rows = _scored_rows(2, state="NC", tier="High")
+        rows[0]["county"] = "tiny_county"
+        rows[1]["county"] = "tiny_county"
+        store.write_scored_locations(
+            pd.DataFrame(rows),
+            scored_dir=populated_store,
+            overwrite=False,
+        )
+        br = store.get_county_breakdown(scored_dir=populated_store)
+        # Every county shows up — the 2-row "tiny_county" that the
+        # top-N query would suppress (under its 25-row floor) is present
+        # in the unfiltered breakdown.
+        counties = set(br["county"])
+        assert "tiny_county" in counties
+        # Its row registers as 100%-High.
+        tiny_row = br[br["county"] == "tiny_county"].iloc[0]
+        assert tiny_row["high_pct"] == pytest.approx(1.0, abs=1e-4)
+        assert tiny_row["total"] == 2
+        # The wider columns from the full breakdown are all present.
+        for col in (
+            "high_count",
+            "moderate_count",
+            "low_count",
+            "unscored_count",
+            "total",
+            "high_pct",
+            "moderate_pct",
+            "low_pct",
+        ):
+            assert col in br.columns
+
+    def test_get_county_breakdown_empty_store(self, store_dir: Path) -> None:
+        br = store.get_county_breakdown(scored_dir=store_dir)
+        assert br.empty
+
     def test_get_top_at_risk_counties(self, populated_store: Path) -> None:
         # Default min_locations=25 — each of our 5 county slots has 30+ rows.
         top = store.get_top_at_risk_counties(scored_dir=populated_store, n=5)

@@ -320,6 +320,57 @@ def get_state_breakdown(
     )
 
 
+def get_county_breakdown(
+    scored_dir: Optional[Path] = None,
+) -> pd.DataFrame:
+    """Full per-county tier counts (every county, not just the top-N).
+
+    Columns: ``state``, ``county``, ``high_count``, ``moderate_count``,
+    ``low_count``, ``unscored_count``, ``total``, ``high_pct``,
+    ``moderate_pct``, ``low_pct``. Counties with NULL ``county`` are
+    dropped so the result is always join-safe. Ordered by ``high_pct``
+    descending so the first row is the most-at-risk county overall —
+    handy for the report's headline lookup.
+
+    This is the full-list cousin of ``get_top_at_risk_counties``: same
+    aggregation grain, no ``LIMIT``, no ``min_locations`` filter. Use
+    this for the per-county summary parquet, and ``get_top_at_risk_counties``
+    for the top-N table inside the report.
+    """
+    return query(
+        f"""
+        SELECT
+            state,
+            county,
+            SUM(CASE WHEN risk_tier = '{_TIER_HIGH}' THEN 1 ELSE 0 END) AS high_count,
+            SUM(CASE WHEN risk_tier = '{_TIER_MODERATE}' THEN 1 ELSE 0 END) AS moderate_count,
+            SUM(CASE WHEN risk_tier = '{_TIER_LOW}' THEN 1 ELSE 0 END) AS low_count,
+            SUM(CASE WHEN risk_tier = '{_TIER_UNSCORED}' THEN 1 ELSE 0 END) AS unscored_count,
+            COUNT(*) AS total,
+            ROUND(
+                SUM(CASE WHEN risk_tier = '{_TIER_HIGH}' THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(*), 0),
+                4
+            ) AS high_pct,
+            ROUND(
+                SUM(CASE WHEN risk_tier = '{_TIER_MODERATE}' THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(*), 0),
+                4
+            ) AS moderate_pct,
+            ROUND(
+                SUM(CASE WHEN risk_tier = '{_TIER_LOW}' THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(*), 0),
+                4
+            ) AS low_pct
+        FROM scored
+        WHERE county IS NOT NULL
+        GROUP BY state, county
+        ORDER BY high_pct DESC NULLS LAST, total DESC
+        """,
+        scored_dir=scored_dir,
+    )
+
+
 def get_top_at_risk_counties(
     n: int = 10,
     scored_dir: Optional[Path] = None,
