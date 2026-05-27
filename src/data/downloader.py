@@ -4,22 +4,54 @@ pipeline depends on.
 
 Datasets
 --------
-- NLCD 2021 Tree Canopy Cover (national GeoTIFF, ~3 GB unzipped) via
-  ``config.CANOPY_RASTER_URL`` → ``data/raw/tcc/``.
-- NLCD 2021 Land Cover (national GeoTIFF, ~3 GB unzipped) via
-  ``config.LANDCOVER_RASTER_URL`` → ``data/raw/landcover/``.
-- USGS 3DEP 1 arc-second elevation tiles (per CONUS state) via the USGS
-  National Map (TNM) Access API → ``data/raw/dem/``.
-- A single pre-computed slope raster (Horn's method, degrees) at
+- **NLCD 2021 Tree Canopy Cover** — fetched as a per-state GeoTIFF subset
+  from MRLC's WCS service (``config.MRLC_TCC_COVERAGE_ID``) →
+  ``data/raw/tcc/``.
+- **NLCD 2021 Land Cover** — fetched as a per-state GeoTIFF subset from
+  MRLC's WCS service (``config.MRLC_LANDCOVER_COVERAGE_ID``) →
+  ``data/raw/landcover/``.
+- **USGS 3DEP 1 arc-second elevation tiles** — fetched per-state via the
+  USGS National Map (TNM) ``products?bbox=...`` endpoint → ``data/raw/dem/``.
+- **Pre-computed slope raster** (Horn's method, degrees) at
   ``config.SLOPE_RASTER_PATH`` derived from the downloaded DEM tiles.
+
+Why WCS for NLCD instead of bulk S3 zips
+----------------------------------------
+The original implementation pinned ``CANOPY_RASTER_URL`` and
+``LANDCOVER_RASTER_URL`` to MRLC's S3 bucket
+(``s3-us-west-2.amazonaws.com/mrlc/...``). Those URLs returned HTTP 403
+``AccessDenied`` in May 2026 — the bucket no longer permits anonymous bulk
+zip downloads. Rather than chase another zip mirror that could break in the
+same way, the downloader was switched to MRLC's WCS service. Three
+practical wins from the migration:
+
+1. **State-shaped payloads instead of a national 3 GB pull.** A WCS
+   GetCoverage with the NC bbox returns ~50-150 MB per coverage instead of
+   the 3 GB national TIFF. For a single-state run we now download 4 % of
+   the data we used to.
+2. **No zip-extraction step.** WCS returns a TIFF directly; the
+   ``_extract_zip`` helper is gone.
+3. **No URL-on-S3 fragility.** WCS is the documented OGC interface MRLC's
+   own viewer is built on, so it's the least-likely-to-disappear path.
+
+Why bbox for DEM instead of polyCode
+------------------------------------
+The TNM API's ``polyType=state&polyCode=<FIPS>`` filter is currently
+non-functional — ``polyCode=37`` (NC) returns ~200 tiles, all in
+Oregon/Idaho. The bbox filter still works and is what TNM's own viewer
+uses internally. State-to-bbox mapping lives in
+``config.STATE_BBOX_WGS84``; the downloader transforms the bbox once per
+call and queries the same first-page-and-dedupe path the TNM viewer uses.
 
 Design decisions
 ----------------
 - **Idempotent.** Every function checks for its output before doing any
   work. Reruns are safe (and cheap).
-- **Streaming downloads.** GeoTIFFs are multi-GB, so we stream chunks with
-  ``httpx`` instead of buffering whole responses in memory, and we drive a
-  ``tqdm`` progress bar from the ``Content-Length`` header when present.
+- **Streaming downloads.** GeoTIFF subsets can still be hundreds of
+  megabytes, so we stream chunks with ``httpx`` instead of buffering whole
+  responses in memory, and we drive a ``tqdm`` progress bar from the
+  ``Content-Length`` header when present (WCS often omits it under
+  chunked encoding; tqdm degrades to "unknown total" gracefully).
 - **Atomic writes.** Files are written to ``<name>.part`` and renamed only
   after a successful download to avoid leaving truncated artifacts on
   Ctrl+C or network failure.
@@ -35,19 +67,17 @@ CLI
 ---
 ::
 
-    python -m src.data.downloader --states CA TX
-    python -m src.data.downloader                # CONUS-wide
-    python -m src.data.downloader --skip-dem     # smoke-test the raster downloads only
+    python -m src.data.downloader --states NC          # NC only (default scope)
+    python -m src.data.downloader --states NC TX       # multiple states
+    python -m src.data.downloader --skip-dem           # smoke-test raster downloads only
 
 All operations log structured JSONL events via :class:`src.utils.logger.PipelineLogger`.
 """
 from __future__ import annotations
 
 import argparse
-import shutil
 import time
 import uuid
-import zipfile
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -66,11 +96,19 @@ _HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=30.0)
 _CHUNK_BYTES = 1 << 20  # 1 MiB chunks for streamed downloads
 
 
-def _stream_download(url: str, dest: Path, logger: PipelineLogger, desc: str) -> Path:
-    """Stream ``url`` to ``dest`` with a tqdm progress bar.
+def _stream_download(
+    url: str,
+    dest: Path,
+    logger: PipelineLogger,
+    desc: str,
+    params: Optional[dict] = None,
+) -> Path:
+    """Stream ``url`` (optionally with ``params``) to ``dest``.
 
     Writes to ``dest.with_suffix(dest.suffix + ".part")`` and atomically
-    renames on success so a partial file never appears at ``dest``.
+    renames on success so a partial file never appears at ``dest``. The
+    ``params`` kwarg is what lets the WCS callers issue a GetCoverage
+    against the same primitive without rebuilding the URL.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     part_path = dest.with_suffix(dest.suffix + ".part")
@@ -79,7 +117,9 @@ def _stream_download(url: str, dest: Path, logger: PipelineLogger, desc: str) ->
 
     start = time.monotonic()
     bytes_written = 0
-    with httpx.stream("GET", url, timeout=_HTTP_TIMEOUT, follow_redirects=True) as resp:
+    with httpx.stream(
+        "GET", url, params=params, timeout=_HTTP_TIMEOUT, follow_redirects=True
+    ) as resp:
         resp.raise_for_status()
         total = int(resp.headers.get("Content-Length", "0")) or None
         with open(part_path, "wb") as out_f, tqdm(
@@ -103,30 +143,6 @@ def _stream_download(url: str, dest: Path, logger: PipelineLogger, desc: str) ->
     return dest
 
 
-def _extract_zip(zip_path: Path, dest_dir: Path, logger: PipelineLogger) -> list[Path]:
-    """Extract every member of ``zip_path`` to ``dest_dir`` and return the
-    extracted file paths."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    start = time.monotonic()
-    extracted: list[Path] = []
-    with zipfile.ZipFile(zip_path) as zf:
-        for member in zf.namelist():
-            target = dest_dir / Path(member).name  # flatten any nested paths
-            if member.endswith("/"):
-                continue
-            with zf.open(member) as src_f, open(target, "wb") as out_f:
-                shutil.copyfileobj(src_f, out_f)
-            extracted.append(target)
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    logger.info(
-        stage="downloader",
-        event_type="ZIP_EXTRACTED",
-        detail={"zip": str(zip_path), "files": [p.name for p in extracted]},
-        duration_ms=elapsed_ms,
-    )
-    return extracted
-
-
 def _raster_already_present(dest_dir: Path) -> Optional[Path]:
     """Return the first GeoTIFF/IMG in ``dest_dir``, or None.
 
@@ -140,14 +156,130 @@ def _raster_already_present(dest_dir: Path) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Bbox helpers (WGS84 ↔ EPSG:5070)
+# ---------------------------------------------------------------------------
+
+
+def _states_to_bbox_wgs84(
+    states: Iterable[str],
+) -> tuple[float, float, float, float]:
+    """Return the union of state bboxes in WGS84 (lon_min, lat_min, lon_max,
+    lat_max).
+
+    Used to size a single WCS GetCoverage / TNM bbox request that covers
+    every requested state. NC-only is the default; multi-state callers get
+    a single bounding rectangle around the union.
+    """
+    bboxes: list[tuple[float, float, float, float]] = []
+    for s in states:
+        bbox = config.STATE_BBOX_WGS84.get(s.upper())
+        if bbox is None:
+            raise ValueError(
+                f"No bounding box configured for state '{s}'. "
+                f"Add it to config.STATE_BBOX_WGS84 first. "
+                f"Currently configured: {sorted(config.STATE_BBOX_WGS84.keys())}"
+            )
+        bboxes.append(bbox)
+    if not bboxes:
+        raise ValueError("At least one state must be supplied to derive a bbox.")
+    lon_min = min(b[0] for b in bboxes)
+    lat_min = min(b[1] for b in bboxes)
+    lon_max = max(b[2] for b in bboxes)
+    lat_max = max(b[3] for b in bboxes)
+    return lon_min, lat_min, lon_max, lat_max
+
+
+def _project_bbox_to_5070(
+    bbox_wgs84: tuple[float, float, float, float],
+    buffer_m: float = 60.0,
+) -> tuple[float, float, float, float]:
+    """Project a WGS84 (lon_min, lat_min, lon_max, lat_max) bbox to
+    EPSG:5070 (Conus Albers, metres).
+
+    Conus Albers is *not* axis-aligned with the WGS84 graticule, so we
+    project all four corners and take the min/max in each axis to get the
+    smallest axis-aligned rectangle in 5070 that fully contains the WGS84
+    rectangle. A small buffer (default one 30m NLCD pixel) is added so
+    edge pixels are never lost to off-by-one boundary effects.
+    """
+    from pyproj import Transformer  # lazy import — pyproj is heavy
+
+    tfm = Transformer.from_crs("EPSG:4326", config.NLCD_RASTER_CRS, always_xy=True)
+    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
+    corners = [
+        (lon_min, lat_min),
+        (lon_max, lat_min),
+        (lon_max, lat_max),
+        (lon_min, lat_max),
+    ]
+    projected = [tfm.transform(lon, lat) for lon, lat in corners]
+    xs = [p[0] for p in projected]
+    ys = [p[1] for p in projected]
+    return (
+        min(xs) - buffer_m,
+        min(ys) - buffer_m,
+        max(xs) + buffer_m,
+        max(ys) + buffer_m,
+    )
+
+
+# ---------------------------------------------------------------------------
+# WCS coverage fetch (TCC + Land Cover)
+# ---------------------------------------------------------------------------
+
+
+def _download_wcs_coverage(
+    coverage_id: str,
+    bbox_wgs84: tuple[float, float, float, float],
+    dest: Path,
+    logger: PipelineLogger,
+    desc: str,
+) -> Path:
+    """Issue a WCS 2.0.1 GetCoverage and stream the response to ``dest``.
+
+    Builds the EPSG:5070 subset from the supplied WGS84 bbox, then calls
+    the shared ``_stream_download`` helper. Returns the final TIFF path.
+    """
+    x_min, y_min, x_max, y_max = _project_bbox_to_5070(bbox_wgs84)
+    # WCS 2.0.1 accepts multiple ``subset`` parameters in the same query.
+    # httpx serialises a list value as repeated keys, which is what the
+    # spec calls for.
+    params = {
+        "service": "WCS",
+        "version": config.MRLC_WCS_VERSION,
+        "request": "GetCoverage",
+        "coverageid": coverage_id,
+        "subset": [f"X({x_min:.0f},{x_max:.0f})", f"Y({y_min:.0f},{y_max:.0f})"],
+        "format": "image/tiff",
+    }
+    logger.info(
+        stage="downloader",
+        event_type="WCS_GETCOVERAGE_START",
+        detail={
+            "coverage_id": coverage_id,
+            "bbox_wgs84": list(bbox_wgs84),
+            "bbox_5070": [round(v, 1) for v in (x_min, y_min, x_max, y_max)],
+        },
+    )
+    return _stream_download(
+        config.MRLC_WCS_BASE, dest, logger, desc=desc, params=params
+    )
+
+
+# ---------------------------------------------------------------------------
 # NLCD Tree Canopy Cover
 # ---------------------------------------------------------------------------
 
 
-def download_tcc(logger: Optional[PipelineLogger] = None) -> Path:
-    """Download and unzip the NLCD 2021 Tree Canopy Cover national GeoTIFF.
+def download_tcc(
+    states: Optional[Iterable[str]] = None,
+    logger: Optional[PipelineLogger] = None,
+) -> Path:
+    """Download a per-state TCC subset via MRLC WCS.
 
-    Idempotent: returns the existing raster path if it already exists.
+    Idempotent: returns the existing raster path if any ``.tif`` is already
+    present under ``config.TCC_DIR``. Use ``states`` to control the bbox;
+    defaults to every state in ``config.STATE_BBOX_WGS84`` (NC today).
     """
     logger = logger or _default_logger()
     existing = _raster_already_present(config.TCC_DIR)
@@ -159,22 +291,33 @@ def download_tcc(logger: Optional[PipelineLogger] = None) -> Path:
         )
         return existing
 
-    logger.info(stage="downloader", event_type="TCC_DOWNLOAD_START",
-                detail={"url": config.CANOPY_RASTER_URL})
-    zip_path = config.TCC_DIR / Path(config.CANOPY_RASTER_URL).name
-    _stream_download(config.CANOPY_RASTER_URL, zip_path, logger, desc="NLCD TCC")
-    extracted = _extract_zip(zip_path, config.TCC_DIR, logger)
-    zip_path.unlink(missing_ok=True)
+    state_list = list(states) if states else sorted(config.STATE_BBOX_WGS84.keys())
+    bbox = _states_to_bbox_wgs84(state_list)
+    config.TCC_DIR.mkdir(parents=True, exist_ok=True)
+    # File name encodes the coverage id + the requested states so a future
+    # reviewer can tell at a glance which subset is on disk. Single-state
+    # files are titled ``...NC.tif``; multi-state ones get ``..._NC_TX.tif``.
+    suffix = "_".join(state_list)
+    dest = config.TCC_DIR / f"nlcd_tcc_conus_2021_v2021-4__{suffix}.tif"
 
-    raster = _raster_already_present(config.TCC_DIR)
-    if raster is None:
-        raise RuntimeError(
-            f"TCC download succeeded but no .tif/.img found in {config.TCC_DIR}. "
-            f"Extracted members: {[p.name for p in extracted]}"
-        )
-    logger.info(stage="downloader", event_type="TCC_DOWNLOAD_DONE",
-                detail={"path": str(raster)})
-    return raster
+    logger.info(
+        stage="downloader",
+        event_type="TCC_DOWNLOAD_START",
+        detail={"coverage_id": config.MRLC_TCC_COVERAGE_ID, "states": state_list},
+    )
+    _download_wcs_coverage(
+        config.MRLC_TCC_COVERAGE_ID,
+        bbox,
+        dest,
+        logger,
+        desc="NLCD TCC (WCS)",
+    )
+    logger.info(
+        stage="downloader",
+        event_type="TCC_DOWNLOAD_DONE",
+        detail={"path": str(dest)},
+    )
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -182,11 +325,14 @@ def download_tcc(logger: Optional[PipelineLogger] = None) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def download_landcover(logger: Optional[PipelineLogger] = None) -> Path:
-    """Download and unzip the NLCD 2021 Land Cover national GeoTIFF.
+def download_landcover(
+    states: Optional[Iterable[str]] = None,
+    logger: Optional[PipelineLogger] = None,
+) -> Path:
+    """Download a per-state Land Cover subset via MRLC WCS.
 
     Same source family as TCC (USGS / MRLC), same CRS (EPSG:5070), same
-    resolution (30m). Idempotent.
+    resolution (30 m), same WCS endpoint. Idempotent.
     """
     logger = logger or _default_logger()
     existing = _raster_already_present(config.LC_DIR)
@@ -198,76 +344,162 @@ def download_landcover(logger: Optional[PipelineLogger] = None) -> Path:
         )
         return existing
 
-    logger.info(stage="downloader", event_type="LANDCOVER_DOWNLOAD_START",
-                detail={"url": config.LANDCOVER_RASTER_URL})
-    zip_path = config.LC_DIR / Path(config.LANDCOVER_RASTER_URL).name
-    _stream_download(config.LANDCOVER_RASTER_URL, zip_path, logger, desc="NLCD LC")
-    extracted = _extract_zip(zip_path, config.LC_DIR, logger)
-    zip_path.unlink(missing_ok=True)
+    state_list = list(states) if states else sorted(config.STATE_BBOX_WGS84.keys())
+    bbox = _states_to_bbox_wgs84(state_list)
+    config.LC_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = "_".join(state_list)
+    dest = config.LC_DIR / f"NLCD_2021_Land_Cover_L48__{suffix}.tif"
 
-    raster = _raster_already_present(config.LC_DIR)
-    if raster is None:
-        raise RuntimeError(
-            f"Land Cover download succeeded but no .tif/.img found in {config.LC_DIR}. "
-            f"Extracted members: {[p.name for p in extracted]}"
-        )
-    logger.info(stage="downloader", event_type="LANDCOVER_DOWNLOAD_DONE",
-                detail={"path": str(raster)})
-    return raster
+    logger.info(
+        stage="downloader",
+        event_type="LANDCOVER_DOWNLOAD_START",
+        detail={
+            "coverage_id": config.MRLC_LANDCOVER_COVERAGE_ID,
+            "states": state_list,
+        },
+    )
+    _download_wcs_coverage(
+        config.MRLC_LANDCOVER_COVERAGE_ID,
+        bbox,
+        dest,
+        logger,
+        desc="NLCD LC (WCS)",
+    )
+    logger.info(
+        stage="downloader",
+        event_type="LANDCOVER_DOWNLOAD_DONE",
+        detail={"path": str(dest)},
+    )
+    return dest
 
 
 # ---------------------------------------------------------------------------
-# USGS 3DEP DEM tiles
+# USGS 3DEP DEM tiles (bbox query)
 # ---------------------------------------------------------------------------
 
 
-def _tnm_query_state(state_abbr: str, *, _client: Optional[httpx.Client] = None) -> list[dict]:
-    """Query the USGS National Map API for all 3DEP 1 arc-second GeoTIFF
-    products that intersect ``state_abbr`` (e.g. "CA").
+_TNM_QUERY_MAX_ATTEMPTS: int = 5
+_TNM_QUERY_BACKOFF_SECONDS: float = 3.0
 
-    Returns the raw ``items`` list from the JSON response. A separate function
-    so tests can mock the network layer in isolation.
+
+def _tnm_query_bbox(
+    bbox_wgs84: tuple[float, float, float, float],
+    *,
+    _client: Optional[httpx.Client] = None,
+    _max_attempts: int = _TNM_QUERY_MAX_ATTEMPTS,
+    _backoff_seconds: float = _TNM_QUERY_BACKOFF_SECONDS,
+    _treat_empty_as_transient: bool = True,
+) -> list[dict]:
+    """Query the USGS TNM API for all 3DEP 1 arc-second tiles that
+    intersect ``bbox_wgs84`` (lon_min, lat_min, lon_max, lat_max).
+
+    Replaces the broken ``polyType=state`` path. The downloader requests
+    ``max=config.TNM_PAGE_SIZE`` (default 200) in a single shot —
+    server-side pagination via ``offset`` is currently broken
+    (``total=0`` after the first page), and TNM's bbox endpoint will
+    happily serve a couple hundred items in one response, which is enough
+    to cover any single CONUS state's ~30-50 1° quads with their multiple
+    vintages. The caller dedupes by 1° quad below.
+
+    TNM has three observed flavors of transient failure:
+      1. HTTP 5xx (gateway timeouts, Lambda errors) — caught by
+         ``raise_for_status``.
+      2. HTTP 200 with a non-JSON body (Python repr, HTML error pages) —
+         caught by ``ValueError`` (``json.JSONDecodeError`` is a
+         ``ValueError``).
+      3. HTTP 200 with valid JSON but ``items: []`` — *also* transient
+         in our experience: the same bbox immediately returns 50 results
+         on a retry. This is what ``_treat_empty_as_transient`` covers.
+         If a caller has a legitimately empty bbox they can disable it.
+
+    All three retry up to ``_max_attempts`` times with a backoff between
+    attempts. Empty-result retries log + return `[]` if they exhaust the
+    budget, since "TNM still says no results" is the only signal we have.
+
+    Returns the raw ``items`` list from the JSON response.
     """
-    fips = config.STATE_FIPS.get(state_abbr.upper())
-    if fips is None:
-        raise ValueError(
-            f"Unknown CONUS state '{state_abbr}'. Expected one of "
-            f"{sorted(config.STATE_FIPS.keys())}"
-        )
+    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
     params = {
         "datasets": config.TNM_DEM_DATASET,
-        "polyType": "state",
-        "polyCode": fips,
+        "bbox": f"{lon_min},{lat_min},{lon_max},{lat_max}",
         "prodFormats": "GeoTIFF",
         "outputFormat": "JSON",
+        "max": config.TNM_PAGE_SIZE,
     }
     client = _client or httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True)
     try:
-        resp = client.get(config.TNM_API_BASE, params=params)
-        resp.raise_for_status()
-        payload = resp.json()
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, _max_attempts + 1):
+            try:
+                resp = client.get(config.TNM_API_BASE, params=params)
+                resp.raise_for_status()
+                payload = resp.json()
+            except (ValueError, httpx.HTTPError) as exc:
+                last_exc = exc
+                if attempt < _max_attempts:
+                    # Linear backoff is enough — TNM glitches are
+                    # second-scale, not minute-scale.
+                    time.sleep(_backoff_seconds)
+                    continue
+                raise
+            items = payload.get("items", []) or []
+            if items or not _treat_empty_as_transient or attempt == _max_attempts:
+                return items
+            # Empty result on a transient-retry attempt — wait and retry.
+            time.sleep(_backoff_seconds)
+        # Loop exited via the empty-list path on the final attempt.
+        return []
     finally:
         if _client is None:
             client.close()
-    items = payload.get("items", []) or []
-    return items
+
+
+def _dedupe_tiles_latest_vintage(items: list[dict]) -> list[dict]:
+    """USGS 3DEP serves multiple vintages for the same 1° quad
+    (e.g. ``n34w079 20250507`` and ``n34w079 20260320``). Pick the latest
+    vintage per (round(min_lat), round(min_lon)) so the mosaic doesn't
+    double-stack on overlapping cells.
+
+    Tile titles follow ``USGS 1 Arc Second n34w079 YYYYMMDD``; the date
+    is the last whitespace-separated token. We compare those tokens
+    lexicographically — sufficient because they're ISO-8601 dates.
+    """
+    by_quad: dict[tuple[int, int], dict] = {}
+    for it in items:
+        bb = it.get("boundingBox", {}) or {}
+        try:
+            key = (int(round(bb["minY"])), int(round(bb["minX"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        title = it.get("title", "") or ""
+        new_date_token = title.split()[-1] if title else ""
+        existing = by_quad.get(key)
+        if existing is None:
+            by_quad[key] = it
+            continue
+        existing_title = existing.get("title", "") or ""
+        existing_date_token = existing_title.split()[-1] if existing_title else ""
+        if new_date_token > existing_date_token:
+            by_quad[key] = it
+    return list(by_quad.values())
 
 
 def download_dem_tiles(
     states: Optional[Iterable[str]] = None,
     logger: Optional[PipelineLogger] = None,
 ) -> list[Path]:
-    """Download USGS 3DEP 1 arc-second DEM tiles for the given CONUS states.
+    """Download USGS 3DEP 1 arc-second DEM tiles for the requested states.
 
-    Idempotent at the *tile* level: each individual tile is skipped if its
-    file already exists in ``config.DEM_DIR``. Re-running for the same set
-    of states is therefore safe.
+    Idempotent at the *tile* level: each tile is skipped if its file
+    already exists in ``config.DEM_DIR``. The bbox query that drives the
+    catalogue lookup is the union of the states' bboxes from
+    ``config.STATE_BBOX_WGS84``.
 
     Parameters
     ----------
     states:
-        Iterable of state abbreviations (e.g. ``["CA", "TX"]``). If ``None``,
-        downloads tiles for every CONUS state in ``config.STATE_FIPS``.
+        Iterable of state abbreviations (e.g. ``["NC"]``). If ``None``,
+        defaults to every state configured in ``config.STATE_BBOX_WGS84``.
 
     Returns
     -------
@@ -276,61 +508,64 @@ def download_dem_tiles(
         newly downloaded and previously cached).
     """
     logger = logger or _default_logger()
-    state_list = (
-        [s.upper() for s in states] if states else sorted(config.STATE_FIPS.keys())
-    )
+    state_list = list(states) if states else sorted(config.STATE_BBOX_WGS84.keys())
+    bbox = _states_to_bbox_wgs84(state_list)
     logger.info(
         stage="downloader",
         event_type="DEM_DOWNLOAD_START",
-        detail={"states": state_list},
+        detail={"states": state_list, "bbox_wgs84": list(bbox)},
     )
 
     tiles: list[Path] = []
     with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
-        for state in state_list:
-            try:
-                items = _tnm_query_state(state, _client=client)
-            except (httpx.HTTPError, ValueError) as exc:
-                logger.error(
+        try:
+            items = _tnm_query_bbox(bbox, _client=client)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.error(
+                stage="downloader",
+                event_type="DEM_BBOX_QUERY_FAILED",
+                detail={"bbox_wgs84": list(bbox), "error": str(exc)},
+            )
+            return tiles
+
+        deduped = _dedupe_tiles_latest_vintage(items)
+        logger.info(
+            stage="downloader",
+            event_type="DEM_BBOX_QUERY_OK",
+            detail={
+                "bbox_wgs84": list(bbox),
+                "raw_count": len(items),
+                "deduped_count": len(deduped),
+            },
+        )
+
+        for item in deduped:
+            url = item.get("downloadURL") or (item.get("urls") or {}).get("TIFF")
+            if not url:
+                logger.warning(
                     stage="downloader",
-                    event_type="DEM_STATE_QUERY_FAILED",
-                    detail={"state": state, "error": str(exc)},
+                    event_type="DEM_TILE_NO_URL",
+                    detail={"title": item.get("title")},
                 )
                 continue
-
-            logger.info(
-                stage="downloader",
-                event_type="DEM_STATE_QUERY_OK",
-                detail={"state": state, "tile_count": len(items)},
-            )
-
-            for item in items:
-                url = item.get("downloadURL") or item.get("urls", {}).get("TIFF")
-                if not url:
-                    logger.warning(
-                        stage="downloader",
-                        event_type="DEM_TILE_NO_URL",
-                        detail={"state": state, "item": item.get("title")},
-                    )
-                    continue
-                dest = config.DEM_DIR / Path(url).name
-                if dest.exists():
-                    logger.info(
-                        stage="downloader",
-                        event_type="DEM_TILE_SKIP_EXISTS",
-                        detail={"path": str(dest)},
-                    )
-                    tiles.append(dest)
-                    continue
-                try:
-                    _stream_download(url, dest, logger, desc=f"DEM {dest.name}")
-                    tiles.append(dest)
-                except httpx.HTTPError as exc:
-                    logger.error(
-                        stage="downloader",
-                        event_type="DEM_TILE_DOWNLOAD_FAILED",
-                        detail={"url": url, "error": str(exc)},
-                    )
+            dest = config.DEM_DIR / Path(url).name
+            if dest.exists():
+                logger.info(
+                    stage="downloader",
+                    event_type="DEM_TILE_SKIP_EXISTS",
+                    detail={"path": str(dest)},
+                )
+                tiles.append(dest)
+                continue
+            try:
+                _stream_download(url, dest, logger, desc=f"DEM {dest.name}")
+                tiles.append(dest)
+            except httpx.HTTPError as exc:
+                logger.error(
+                    stage="downloader",
+                    event_type="DEM_TILE_DOWNLOAD_FAILED",
+                    detail={"url": url, "error": str(exc)},
+                )
 
     logger.info(
         stage="downloader",
@@ -361,12 +596,6 @@ def _horn_slope_degrees(elev: np.ndarray, cellsize_x: float, cellsize_y: float) 
     if h < 3 or w < 3:
         return slope
 
-    # 8-neighbour Horn weights:
-    # dz/dx = ((c+2f+i) - (a+2d+g)) / (8 * cellsize_x)
-    # dz/dy = ((g+2h+i) - (a+2b+c)) / (8 * cellsize_y)
-    # where positions are:  a b c
-    #                       d e f
-    #                       g h i
     a = z[0:-2, 0:-2]
     b = z[0:-2, 1:-1]
     c = z[0:-2, 2:]
@@ -398,7 +627,6 @@ def precompute_slope_raster(logger: Optional[PipelineLogger] = None) -> Path:
     Idempotent: returns the existing path if the slope raster already
     exists.
     """
-    # Lazy rasterio import so importing this module is cheap.
     import rasterio
     from rasterio.merge import merge as rio_merge
 
@@ -428,16 +656,15 @@ def precompute_slope_raster(logger: Optional[PipelineLogger] = None) -> Path:
     )
     start = time.monotonic()
 
-    # Merge tiles into a single in-memory mosaic. For CONUS this can be
-    # large; production scale should switch to a windowed read loop, but
-    # for the per-state subsets the build plan supports this fits in memory
-    # comfortably.
     sources = [rasterio.open(t) for t in tiles]
     try:
         mosaic, mosaic_transform = rio_merge(sources)
         ref = sources[0]
         crs = ref.crs
         nodata = ref.nodata
+        mosaic_bounds = rasterio.transform.array_bounds(
+            mosaic.shape[1], mosaic.shape[2], mosaic_transform
+        )
     finally:
         for s in sources:
             s.close()
@@ -446,9 +673,32 @@ def precompute_slope_raster(logger: Optional[PipelineLogger] = None) -> Path:
     if nodata is not None:
         elev = np.where(elev == nodata, np.nan, elev)
 
-    cellsize_x = float(abs(mosaic_transform.a))
-    cellsize_y = float(abs(mosaic_transform.e))
-    slope = _horn_slope_degrees(elev, cellsize_x, cellsize_y)
+    # Horn's slope wants cell size in the SAME units as the elevation values.
+    # USGS 3DEP tiles are in EPSG:4269 (NAD83 lat/lon) but elevation is in
+    # metres, so the raw pixel size (0.000277° ≈ 30 m) needs converting
+    # before we divide elevation by it. For projected CRSes (e.g. UTM,
+    # EPSG:5070) the transform is already in metres and no conversion is
+    # needed.
+    raw_cellsize_x = float(abs(mosaic_transform.a))
+    raw_cellsize_y = float(abs(mosaic_transform.e))
+    if crs is not None and crs.is_geographic:
+        # Approximate the centre latitude of the mosaic and convert
+        # degree-cells to metres there. 111_320 m/deg is the standard
+        # geographic factor (1 minute of latitude = 1 nautical mile by
+        # historical definition); longitudinal degrees shrink by cos(lat).
+        # The error from picking the centre latitude over per-row
+        # latitude is <3% across NC's 3° height — safely below the
+        # accuracy of any downstream slope threshold in the scoring tools.
+        lon_min, lat_min, lon_max, lat_max = mosaic_bounds
+        centre_lat_rad = np.deg2rad((lat_min + lat_max) / 2.0)
+        deg_to_m = 111_320.0
+        cellsize_x_m = raw_cellsize_x * deg_to_m * np.cos(centre_lat_rad)
+        cellsize_y_m = raw_cellsize_y * deg_to_m
+    else:
+        cellsize_x_m = raw_cellsize_x
+        cellsize_y_m = raw_cellsize_y
+
+    slope = _horn_slope_degrees(elev, cellsize_x_m, cellsize_y_m)
     slope_out = np.where(np.isnan(slope), -9999.0, slope).astype(np.float32)
 
     config.SLOPE_RASTER_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -476,8 +726,11 @@ def precompute_slope_raster(logger: Optional[PipelineLogger] = None) -> Path:
         detail={
             "path": str(config.SLOPE_RASTER_PATH),
             "shape": list(slope_out.shape),
-            "cellsize_x": cellsize_x,
-            "cellsize_y": cellsize_y,
+            "raw_cellsize_x": raw_cellsize_x,
+            "raw_cellsize_y": raw_cellsize_y,
+            "cellsize_x_m": cellsize_x_m,
+            "cellsize_y_m": cellsize_y_m,
+            "crs": str(crs),
         },
         duration_ms=elapsed_ms,
     )
@@ -496,15 +749,17 @@ def _default_logger() -> PipelineLogger:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="src.data.downloader",
-        description="Download NLCD TCC + NLCD Land Cover + USGS 3DEP DEM tiles "
-                    "and pre-compute the slope raster.",
+        description="Download NLCD TCC + NLCD Land Cover (via MRLC WCS) and "
+                    "USGS 3DEP DEM tiles (via TNM bbox), then pre-compute "
+                    "the slope raster.",
     )
     parser.add_argument(
         "--states",
         nargs="+",
         default=None,
-        help="CONUS state abbreviations to download DEM for (e.g. CA TX). "
-             "If omitted, downloads tiles for all 48 + DC.",
+        help="State abbreviations to download for (e.g. NC). If omitted, "
+             "uses every state configured in config.STATE_BBOX_WGS84 (NC "
+             "is the only configured state at this time).",
     )
     parser.add_argument(
         "--skip-tcc", action="store_true", help="Skip the NLCD TCC download.",
@@ -533,9 +788,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         if not args.skip_tcc:
-            download_tcc(logger)
+            download_tcc(args.states, logger)
         if not args.skip_landcover:
-            download_landcover(logger)
+            download_landcover(args.states, logger)
         if not args.skip_dem:
             download_dem_tiles(args.states, logger)
             if not args.skip_slope:

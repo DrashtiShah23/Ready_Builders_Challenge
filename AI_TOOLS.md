@@ -105,6 +105,39 @@ Decisions tied to the redesign:
 
 7. **Cost projection is documented in `src/config.py`** alongside the agent config block so a reviewer reading the constants sees the redesign's economic basis without having to dig through this file.
 
+## Phase 8 follow-up — MRLC source migration
+
+After Phase 8 was merged, the downloader had to be patched before Phase 9 could run because two of its data sources broke since the code was originally written:
+
+1. **MRLC S3 bulk zips return HTTP 403 `AccessDenied`** for both `nlcd_tcc_conus_2021_v2021-4.zip` and `nlcd_2021_land_cover_l48_20230630.zip`. The MRLC bucket policy locked down anonymous bulk-zip downloads. Verified with both `httpx` and `curl`, with and without a browser User-Agent and a `Referer: mrlc.gov` header. The mrlc.gov-hosted mirror at `/downloads/sciweb1/shared/mrlc/data-bundles/...` returns 404.
+
+2. **USGS TNM API `polyType=state&polyCode=<FIPS>` filter is non-functional.** `polyCode=37` (NC FIPS) returns ~200 tiles all in Oregon/Idaho; `polyCode=06` (CA) returns 0 tiles; `polygonCode=NC` returns 6618 tiles starting in Hawaii. Probed multiple parameter naming variants — every one was either ignored, returned non-JSON, or returned geographically wrong results. The TNM `bbox` filter still works correctly.
+
+**Decision: migrate both, document, ship before Phase 9.**
+
+For NLCD I switched from the bulk-zip path to MRLC's WCS (OGC Web Coverage Service) at `https://www.mrlc.gov/geoserver/mrlc_download/wcs`. This is the same dataset family (same source, same year, same version, same EPSG:5070 CRS) but served as a queryable coverage instead of a 3 GB national zip. For the NC use case the WCS NC subset is ~50-150 MB per layer instead of 3 GB — we now download 4 % of the bytes we used to. The migration is *also* a real architectural improvement independent of the bucket lockdown:
+
+* **Right-sized payloads.** The WCS server does the subsetting; we no longer pull the national raster to use 0.4 % of it.
+* **No zip extraction.** WCS returns a TIFF directly. The `_extract_zip` helper is gone, along with the whole class of "zip contained nothing readable" failures.
+* **State-scoped reruns are cheap.** Adding a state means adding a row to `config.STATE_BBOX_WGS84` and rerunning the downloader with that state — the existing TIFFs for other states stay put.
+* **OGC-standard interface.** WCS is the same path MRLC's own viewer uses internally, so it's the least-likely-to-disappear option going forward.
+
+For DEM I switched from `polyType=state&polyCode=<FIPS>` to `bbox=lon_min,lat_min,lon_max,lat_max`. The bbox is derived from `config.STATE_BBOX_WGS84` — the same NC bounding box (`-84.32, 33.75, -75.46, 36.59`) the orchestrator's geographic-sanity validation check already uses. Two TNM-shaped knobs to call out:
+
+* **Page size.** TNM's `max` parameter defaults to 50 but the server happily returns a couple hundred items in a single response. NC has ~126 raw catalogue entries (3+ vintages × 38 land quads), so the default 50 silently clipped the western mountain quads off the page. The downloader requests `max=200` (`config.TNM_PAGE_SIZE`) so the full state catalogue arrives in one shot, then dedupes by 1° quad keeping the latest vintage. Server-side pagination via `offset` is currently broken (`total=0` after the first page), so one large request is the cleanest path.
+* **Transient failures.** Three observed flavours: HTTP 5xx, HTTP 200 with non-JSON Python-repr bodies, and HTTP 200 with valid JSON but `items: []`. All three retry up to 5 times with a 3-second backoff. The empty-items-as-transient heuristic is opt-out via `_treat_empty_as_transient=False` for callers that legitimately query empty bboxes.
+
+Latent bug surfaced + fixed in the same patch: `precompute_slope_raster` was passing the DEM's raw pixel size (`mosaic_transform.a` ≈ 0.000278°) to Horn's method even though the elevation values are in metres. On geographic-CRS DEMs (EPSG:4269 for 3DEP) this made every slope blow up to ~89.99°. The old unit test passed because the synthetic DEM used a unit cellsize and a unit elevation step, which made the bug invisible. The downloader now detects `crs.is_geographic`, converts the pixel size to metres at the raster's centre latitude (`111_320 × cos(lat_centre)` east-west, `111_320` north-south), and logs both raw and converted cell sizes. Validated on real NC data: Raleigh median 2.5°, Cape Hatteras 0.05°, Wilmington 0.8° — physically plausible. A new regression test runs a geographic-CRS synthetic DEM through the kernel and asserts the median slope is in the physically expected range.
+
+Touched files (small surgical patch in `feature/fix-downloader-sources` ahead of Phase 9):
+
+* `src/config.py` — removed `CANOPY_RASTER_URL` / `LANDCOVER_RASTER_URL`; added `MRLC_WCS_BASE`, `MRLC_WCS_VERSION`, `MRLC_TCC_COVERAGE_ID`, `MRLC_LANDCOVER_COVERAGE_ID`, `NLCD_RASTER_CRS`, `TNM_PAGE_SIZE`, and `STATE_BBOX_WGS84`.
+* `src/data/downloader.py` — rewrote TCC/LC fetch around `_download_wcs_coverage` (WGS84→EPSG:5070 projection, WCS GetCoverage, atomic streaming write). Replaced `_tnm_query_state` with `_tnm_query_bbox`. Added `_dedupe_tiles_latest_vintage` to handle TNM's same-quad/multiple-vintages output. Dropped the zip-extraction code path entirely. `download_tcc` and `download_landcover` now take an optional `states` list and encode it into the output filename (`..._NC.tif`) so multi-state runs don't collide.
+* `tests/test_downloader.py` — replaced zip-extraction tests with WCS-request-shape assertions, replaced polyCode tests with bbox-query tests, added coverage for `_states_to_bbox_wgs84`, `_project_bbox_to_5070`, and `_dedupe_tiles_latest_vintage`.
+* `docs/data_sourcing.md` — documented both migrations under their own headings ("MRLC bulk zips → WCS" and "TNM `polyType=state` → `bbox`"), updated the version pins section to use the new WCS coverage ids.
+
+Trade-off worth noting: the WCS server occasionally omits `Content-Length` (chunked encoding). `tqdm` degrades to "unknown total" gracefully but the progress bar shows only bytes-so-far, not a percentage. Acceptable given the alternative (a broken downloader). Logs still record `bytes_written` in the `HTTP_DOWNLOAD_DONE` event so a reviewer auditing a run can see the exact size that was pulled.
+
 ## Phase 8 — State store and pipeline runner
 
 Phase 8 was reinterpreted under the Phase 7 redesign — the original per-batch checkpoint loop no longer exists, so the deliverables had to be re-shaped while preserving the spirit (state store, DuckDB analytics, resumability, `--states` filter, clean shutdown).
