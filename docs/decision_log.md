@@ -1,30 +1,127 @@
 # Decision Log
 
-Every major design decision in this project, the alternatives considered, the reasoning, and what I would revisit. This is the source-of-truth file referenced from `README.md`.
+Every major design decision in this project is recorded here.
 
-| # | Decision | Alternatives considered | Reasoning | What I'd revisit |
-|---|---|---|---|---|
-| 1 | Python 3.11+ as the implementation language | Rust, Go, Scala | Standard for data engineering. `rasterio`, `geopandas`, `duckdb` all have first-class Python bindings. Aligns with the role's stack. | — |
-| 2 | rasterio + GeoPandas over PostGIS | PostGIS + Docker, GDAL CLI scripts | Point-in-raster lookups are natively a raster operation. PostGIS adds a database server and Docker infrastructure for zero analytical benefit at this scale. | PostGIS would matter for polygon spatial joins at 100x scale. |
-| 3 | Native Anthropic SDK over LangChain | LangChain, LangGraph, CrewAI | Fewer abstractions = clearer tool call tracing. Every step of the agent loop is visible and debuggable. Critical for a live review where I have to defend every line. | LangGraph for complex multi-agent graphs once the agent count grows beyond 5. |
-| 4 | NLCD Land Cover over OSM buildings (v1.0 → v2.0 change) | OSM building footprints | (a) OSM completeness is lowest in rural areas — exactly where underserved communities live. Using it would bias the analysis against the very locations we are trying to serve. (b) NLCD is the same dataset family as TCC: same CRS (EPSG:5070), same resolution (30m), same download. Zero added infrastructure. (c) Land cover cross-validates TCC instead of adding independent noise — if TCC says 80% canopy and NLCD says forest, that's a confident signal; if they disagree, it's a quality flag. | Building height data when it becomes nationally available (USGS 3DEP LiDAR expansion). |
-| 5 | DuckDB over PostgreSQL | PostgreSQL, pandas in-memory | Embeddable, no server, SQL directly on Parquet files. Handles 1M+ rows analytically without loading into memory. State-partitioned Parquet enables resumable runs for free. | Cloud data warehouse (BigQuery / Redshift / Snowflake) at 100x scale. |
-| 6 | Pre-computed slope raster over per-point Horn's method | Per-point 3x3 windowed reads at query time | At 1M locations, per-point slope = 1M rasterio reads with a 3x3 window each. Pre-computing once = 1 GDAL operation + 1M cheap pixel lookups. ~100x faster, eliminates a class of edge-case bugs at raster boundaries. | — |
-| 7 | Claude Sonnet for orchestration, Opus reserved for planning | Opus throughout, GPT-4 | Sonnet is sufficient for structured tool dispatch. At 20k Claude calls (1M / 50 per batch), cost management is a real engineering constraint, not a hypothetical. Opus is reserved for ambiguous reasoning (anomaly explanations, interactive-mode plain-English output). | Anthropic batch API once it supports tool_use natively for a further cost reduction. |
-| 8 | Risk weights 50/30/20 (TCC / terrain / land cover) — v1.0 → v2.0 change | 60/25/15 (v1.0, with OSM buildings as the third factor) | TCC 50%: install guide explicitly names tree branches as the primary obstruction. Terrain 30%: slope is a hard physical constraint on the 25° elevation minimum — elevated mounting overcomes canopy more often than it overcomes a deep valley. Land cover 20%: cross-validates TCC but is partially redundant for forested areas, so weighted lower. All weights are sourced from `src/config.py` — change one number to retune the whole pipeline. | Calibrate weights against a held-out set of locations with known service quality once that signal becomes available from the Ready team. |
+<table>
+  <tr>
+    <th>Number</th>
+    <th>Decision</th>
+    <th>Alternatives considered</th>
+    <th>Reasoning</th>
+    <th>Implementation</th>
+    <th>What I would revisit</th>
+  </tr>
+  <tr>
+    <td>1</td>
+    <td>Python 3.11 as the implementation language</td>
+    <td>Rust for data pipeline, Go for data pipeline, Scala for Spark jobs</td>
+    <td>Python is standard for data engineering and geospatial analysis. The required libraries have strong Python support.</td>
+    <td><a href="../pipeline.py">pipeline.py</a></td>
+    <td>Rust for performance critical components if scale grows.</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td>rasterio and GeoPandas over PostGIS</td>
+    <td>PostGIS with Docker, GDAL command line scripts, direct database spatial joins</td>
+    <td>Point in raster lookups are native raster operations. A database server adds operational burden without improving raster sampling.</td>
+    <td><a href="../src/tools/tcc.py">src/tools/tcc.py</a></td>
+    <td>PostGIS for polygon spatial joins at much larger scale.</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td>Native Anthropic SDK over LangChain style frameworks</td>
+    <td>LangChain tool wrappers, LangGraph agent graphs, CrewAI agent framework</td>
+    <td>Fewer abstractions keep tool call tracing visible and debuggable. This is critical for a live review and for tests.</td>
+    <td><a href="../src/agents/orchestrator.py">src/agents/orchestrator.py</a></td>
+    <td>LangGraph once the agent graph grows beyond five tools.</td>
+  </tr>
+  <tr>
+    <td>4</td>
+    <td>NLCD Land Cover over OSM building footprints</td>
+    <td>OSM building footprints only, OSM plus a building density proxy, county building permit datasets</td>
+    <td>OSM completeness is weakest in rural areas that matter most for underserved communities. NLCD is nationally consistent and aligns with canopy data.</td>
+    <td><a href="../src/tools/landcover.py">src/tools/landcover.py</a></td>
+    <td>Building height data when a national public dataset becomes available.</td>
+  </tr>
+  <tr>
+    <td>5</td>
+    <td>DuckDB over PostgreSQL</td>
+    <td>PostgreSQL server, pandas only aggregation, cloud warehouse queries</td>
+    <td>DuckDB runs SQL directly on Parquet with no server. This keeps the repo runnable without infrastructure.</td>
+    <td><a href="../src/data/store.py">src/data/store.py</a></td>
+    <td>Cloud warehouse at much larger national scale.</td>
+  </tr>
+  <tr>
+    <td>6</td>
+    <td>Precomputed slope raster over per point Horn method</td>
+    <td>Per point Horn kernel reads, on demand elevation windows, slope computed during enrichment</td>
+    <td>Per point slope would require one windowed read per location and would be slow. Precomputing once makes per location reads cheap.</td>
+    <td><a href="../src/data/downloader.py">src/data/downloader.py</a></td>
+    <td>Recompute slope when DEM vintage changes or resolution changes.</td>
+  </tr>
+  <tr>
+    <td>7</td>
+    <td>Pipeline level Claude orchestration over per batch reasoning</td>
+    <td>Per batch Claude calls over 50 locations, per row Claude reasoning, per row tool dispatch</td>
+    <td>Per batch reasoning would require about 46,700 Claude calls on 4.67M rows. Pipeline orchestration uses one orchestration session of approximately 6 turns and costs about 0.098 dollars.</td>
+    <td><a href="../src/agents/orchestrator.py">src/agents/orchestrator.py</a></td>
+    <td>Async dispatch when a batches API supports tool_use orchestration.</td>
+  </tr>
+  <tr>
+    <td>8</td>
+    <td>Claude Sonnet for orchestration and Opus reserved for planning</td>
+    <td>Claude Opus for orchestration, GPT 4 style model for orchestration, no model reasoning</td>
+    <td>Orchestration requires structured tool decisions rather than deep creative reasoning. A smaller model keeps cost low while preserving correctness.</td>
+    <td><a href="../src/config.py">src/config.py</a></td>
+    <td>Opus for interactive explanations once a user interface requires higher quality prose.</td>
+  </tr>
+  <tr>
+    <td>9</td>
+    <td>Risk weights 50 30 20 for canopy, terrain, and land cover</td>
+    <td>Weights 60 25 15, equal weights, learned weights from calibration data</td>
+    <td>Canopy is the primary obstruction named by the install guide. Terrain is a hard constraint and land cover provides supporting context.</td>
+    <td><a href="../src/config.py">src/config.py</a></td>
+    <td>Calibration against measured service quality once outcomes exist.</td>
+  </tr>
+  <tr>
+    <td>10</td>
+    <td>Single orchestrator with five tools over multiple distinct agent classes</td>
+    <td>Separate IngestionAgent class, EnvironmentalAgent class, ScoringAgent class each with their own Claude client</td>
+    <td>The pipeline is sequential with no parallel branches. Multiple agent classes would add coordination overhead without analytical benefit. The five tools provide clear scope boundaries equivalent to agent boundaries while keeping orchestration visible in one place.</td>
+    <td><a href="../src/agents/orchestrator.py">src/agents/orchestrator.py</a></td>
+    <td>Split into separate agent processes if parallel enrichment becomes needed at larger scale.</td>
+  </tr>
+</table>
 
-## Drift detection strategy (added in Phase 11)
+## Drift detection strategy
 
-When the pipeline reruns on updated data next quarter, compare the risk score distribution (mean, P25, P75, P90) against this baseline run. A shift of >5% in the High tier proportion triggers a review of NLCD TCC and Land Cover dataset versions — MRLC releases updated NLCD data on a 2-3 year cycle.
+When the pipeline reruns next quarter, compare the risk score distribution to this baseline.
+If High tier share shifts by more than 5 percent, review NLCD dataset versions.
 
-Why these specific signals:
+<table>
+  <tr>
+    <th>Signal</th>
+    <th>Why it matters</th>
+    <th>Implementation hook</th>
+  </tr>
+  <tr>
+    <td>Tier proportion shift</td>
+    <td>It changes the headline narrative a broadband officer reads.</td>
+    <td>src/utils/metrics.py compute_pipeline_metrics output_quality tier_distribution</td>
+  </tr>
+  <tr>
+    <td>Risk score percentiles</td>
+    <td>They detect distribution drift that tier bins can hide.</td>
+    <td>src/utils/metrics.py compute_pipeline_metrics output_quality mean_risk_score</td>
+  </tr>
+  <tr>
+    <td>Likely root cause</td>
+    <td>NLCD updates affect the largest weight and can shift outcomes.</td>
+    <td>docs/data_sourcing.md version pins and config coverage identifiers</td>
+  </tr>
+</table>
 
-- **Tier proportion shift** is the most reportable change — a state broadband officer reads the executive summary as "X% of homes are at high risk", so a >5% absolute shift between runs is the threshold at which the headline narrative changes and a review is warranted. <5% drift is normal sampling variance plus minor geocoding churn and is not worth flagging.
-- **Risk score percentiles (mean / P25 / P75 / P90)** catch shifts in the underlying distribution that the discrete tier counts smooth over — e.g. a uniform 10% TCC bump across all rows would barely move tier counts (since the thresholds are wide) but would move P75 noticeably.
-- **NLCD version is the most likely root cause** because TCC is the largest scoring weight (50%) and MRLC's release cadence (2-3 years) means a quarterly rerun is the typical first place a real-world data refresh shows up. The DEM cadence (10+ years for full national updates) and the locations CSV cadence (release-by-release) are both slower.
+## Version change note
 
-How to implement: the operational hook is `src.utils.metrics.compute_pipeline_metrics`, which already emits `output_quality.tier_distribution` and `output_quality.mean_risk_score`. A future watchdog can persist one row per run and compare the latest to the baseline; the threshold (>5%) is the documented review trigger.
-
-## v1.0 → v2.0 change note
-
-The original design used OSM building footprints as the third scoring factor with weights 60/25/15. I changed both the third factor and the weights for the reasons captured in row 4 and row 8 above. This is documented as a single coherent revision (v1.0 → v2.0) in the build plan changelog. The change is a worked example of iterative design reasoning: the original plan was technically buildable but had a sourcing flaw (OSM rural sparsity) that would have undermined the analysis in exactly the populations the challenge targets.
+The initial plan used OSM buildings as a third factor with weights 60 25 15.
+The system moved to NLCD land cover and weights 50 30 20 for documented reasons above.

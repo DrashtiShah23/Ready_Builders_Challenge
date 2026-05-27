@@ -34,7 +34,10 @@ Public API
 ----------
 ``score_tcc``, ``score_terrain``, ``score_landcover`` — pure per-signal scorers.
 ``tier_for`` — maps a composite score to ``"Low" / "Moderate" / "High" / "UNSCORED"``.
-``score_components`` — Phase 7's Claude-tool entry point. Returns a JSON-ready dict.
+``score_components`` — per-row scoring entry point used by the
+orchestrator's ``score_risk`` tool (the Phase 7 redesign keeps Claude
+out of the per-row hot path; this function is plain Python, called in a
+loop over the enriched-locations parquet). Returns a JSON-ready dict.
 ``compute_risk_score`` — the high-level agent entry. Takes a full
 ``EnrichedLocation`` and returns a full ``ScoredLocation``.
 """
@@ -173,7 +176,8 @@ def tier_for(risk_score: Optional[float]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Aggregator — Phase 7's Claude tool calls this
+# Aggregator — called per row by the orchestrator's ``score_risk`` tool
+# (Phase 7 pipeline-level dispatch, no per-row Claude reasoning).
 # ---------------------------------------------------------------------------
 
 
@@ -185,9 +189,13 @@ def score_components(
 ) -> dict[str, Any]:
     """Compute every component score, the composite, the tier, and scoring flags.
 
-    This is the function Phase 7's Claude ``compute_risk_score`` tool calls.
-    The return shape is intentionally a plain JSON-serialisable ``dict`` so
-    Claude can be handed it as the ``tool_result`` content directly.
+    Called per row by the orchestrator's ``score_risk`` tool handler
+    (`PipelineOrchestrator._run_score_risk`); the return shape is a
+    plain JSON-serialisable ``dict`` because the original build plan
+    exposed this function as a per-row Claude tool, and the dict shape
+    was preserved through the Phase 7 redesign so the public API stayed
+    stable for downstream callers (interactive-mode scoring still goes
+    through this exact function).
 
     Parameters
     ----------

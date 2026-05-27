@@ -48,8 +48,9 @@ for _d in (TCC_DIR, LC_DIR, DEM_DIR, PROCESSED_DIR, SCORED_DIR, LOG_DIR):
 ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
 
 # --- Agent Configuration ---
-# Pipeline-orchestration design (Phase 7 redesign): Claude makes ONE API call
-# and orchestrates 5 pipeline-level tools. Each tool internally runs the full
+# Pipeline-orchestration design (Phase 7 redesign): Claude runs one
+# orchestration session of approximately 6 turns (tool_use loop) and
+# orchestrates 5 pipeline-level tools. Each tool internally runs the full
 # dataset through the existing Phase 1-6 agents. No per-batch Claude reasoning
 # at scale — the per-location reasoning surface is preserved only in the
 # interactive mode (single-location query, ~$0.01 per call).
@@ -59,8 +60,14 @@ CLAUDE_TEMPERATURE: int = 0          # Deterministic — required for reproducib
 MAX_AGENT_TURNS: int = 20            # Safety cap on tool call turns in the orchestrator loop.
 DEMO_SAMPLE_SIZE: int | None = None  # None = full dataset. Set to int for testing (e.g. 10_000).
 
+# --- Interactive mode (Sample Agentic Scenario 3) ---
+# After scoring a customer coordinate, search the scored parquet for
+# nearby locations with strictly lower risk scores within this radius.
+INTERACTIVE_BUFFER_METERS: float = 5_000.0
+INTERACTIVE_ALTERNATIVES_TOP_N: int = 3
+
 # --- Full scale cost projection (documented for README) ---
-# At pipeline-orchestration design (5 tools, 1 Claude call):
+# At pipeline-orchestration design (5 tools, ~6 orchestration turns):
 # Total API cost for full 4.67M row run: < $1.00
 # Token usage: ~2,000 input + ~1,500 output = ~3,500 tokens total
 # Compare: per-batch design at 100 locations/call = ~$10,600 for full dataset

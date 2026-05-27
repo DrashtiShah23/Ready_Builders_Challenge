@@ -512,6 +512,71 @@ def test_interactive_mode_returns_explanation(
     assert {"tcc_score", "terrain_score", "landcover_score"} <= set(
         result["component_scores"].keys()
     )
+    assert "better_alternatives" in result
+    assert isinstance(result["better_alternatives"], list)
+    assert result["buffer_meters"] == config.INTERACTIVE_BUFFER_METERS
+
+
+def test_interactive_passes_buffer_meters_to_alternatives_search(
+    orch: PipelineOrchestrator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Custom buffer radius is forwarded to find_better_alternatives."""
+    monkeypatch.setattr(
+        orch_mod, "fetch_tcc", lambda lat, lon: {"tcc_pct": 5, "tcc_missing": False}
+    )
+    monkeypatch.setattr(
+        orch_mod,
+        "fetch_elevation",
+        lambda lat, lon: {
+            "elevation_m": 100.0,
+            "slope_deg": 2.0,
+            "aspect_deg": 90.0,
+            "elevation_missing": False,
+        },
+    )
+    monkeypatch.setattr(
+        orch_mod,
+        "fetch_land_cover",
+        lambda lat, lon: {
+            "land_cover_code": 71,
+            "land_cover_class": "Grassland/Herbaceous",
+            "lc_missing": False,
+        },
+    )
+    orch.client.messages.create = MagicMock(
+        return_value=_response("end_turn", [_text_block("ok")])
+    )
+    captured: list[float] = []
+
+    def _fake_find(
+        scored_path: Path,
+        latitude: float,
+        longitude: float,
+        queried_risk_score: object,
+        *,
+        buffer_meters: float = 5_000.0,
+        top_n: int = 3,
+    ) -> list[dict[str, object]]:
+        captured.append(buffer_meters)
+        return [
+            {
+                "location_id": "alt-1",
+                "latitude": latitude + 0.001,
+                "longitude": longitude,
+                "county": "37001",
+                "risk_score": 0.1,
+                "risk_tier": TIER_LOW,
+                "distance_m": 100.0,
+            }
+        ]
+
+    monkeypatch.setattr(orch_mod, "find_better_alternatives", _fake_find)
+    result = orch.run_interactive(35.5, -80.0, buffer_meters=2_500.0)
+
+    assert captured == [2_500.0]
+    assert result["buffer_meters"] == 2_500.0
+    assert len(result["better_alternatives"]) == 1
+    assert result["better_alternatives"][0]["location_id"] == "alt-1"
 
 
 def test_interactive_mode_survives_claude_failure(
@@ -952,7 +1017,7 @@ class TestCostEstimate:
         logger: _CaptureLogger,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """``run_interactive`` makes one Claude call → exactly one cost event."""
+        """``run_interactive`` makes one explanation call → exactly one cost event."""
         monkeypatch.setattr(
             orch_mod, "fetch_tcc", lambda lat, lon: {"tcc_pct": 60, "tcc_missing": False}
         )
@@ -1708,6 +1773,11 @@ class TestRenderMap:
             "Land cover",
         ):
             assert label in html, f"tooltip field missing: {label}"
+        # Region filter controls (Phase 12/13)
+        assert "county-filter-select" in html
+        assert "Filter by county" in html
+        assert "state-filter-select" in html
+        assert "Filter by state" in html
 
     def test_unscored_rows_are_excluded(
         self,

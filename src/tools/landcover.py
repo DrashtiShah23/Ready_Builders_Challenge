@@ -4,8 +4,11 @@
 Returns the raw NLCD class code (integer) plus a human-readable class
 name (e.g. "Evergreen Forest", "Developed, Low Intensity"). Used by the
 Environmental Data Agent (Phase 5) alongside ``fetch_tcc``. Not exposed
-as a Claude tool — Phase 7's orchestrator passes the resulting
-``land_cover_code`` to ``compute_risk_score`` as a plain integer input.
+as a Claude tool — the Phase 7 redesign moved Claude's tool surface up
+to five pipeline-level tools, so ``fetch_land_cover`` is now called
+inside ``sample_environment``'s Python loop and the resulting
+``land_cover_code`` flows downstream as a plain integer column on the
+``EnrichedLocation`` parquet that ``score_risk`` consumes.
 
 Design notes
 ------------

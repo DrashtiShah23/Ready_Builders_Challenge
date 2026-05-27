@@ -315,12 +315,42 @@ class TestModeFlag:
             pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
         )
         monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(pipeline_mod, "_ensure_rasters", lambda _csv: True)
 
         rc = pipeline_mod.main(
             ["--mode", "interactive", "--lat", "35.5", "--lon", "-80.0"]
         )
         assert rc == 0
-        stub.run_interactive.assert_called_once_with(35.5, -80.0)
+        stub.run_interactive.assert_called_once_with(
+            35.5, -80.0, buffer_meters=None
+        )
+
+    def test_interactive_buffer_flag_is_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(pipeline_mod, "_ensure_rasters", lambda _csv: True)
+
+        rc = pipeline_mod.main(
+            [
+                "--mode",
+                "interactive",
+                "--lat",
+                "35.5",
+                "--lon",
+                "-80.0",
+                "--buffer",
+                "2500",
+            ]
+        )
+        assert rc == 0
+        stub.run_interactive.assert_called_once_with(
+            35.5, -80.0, buffer_meters=2500.0
+        )
 
     def test_mode_batch_is_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         stub = _build_orchestrator_stub()
@@ -328,6 +358,7 @@ class TestModeFlag:
             pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
         )
         monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(pipeline_mod, "_ensure_rasters", lambda _csv: True)
 
         pipeline_mod.main(["--csv", "fake.csv"])
         stub.run.assert_called_once()
@@ -340,12 +371,35 @@ class TestModeFlag:
             pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
         )
         monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(pipeline_mod, "_ensure_rasters", lambda _csv: True)
 
         rc = pipeline_mod.main(
             ["--interactive", "--lat", "35.5", "--lon", "-80.0"]
         )
         assert rc == 0
-        stub.run_interactive.assert_called_once_with(35.5, -80.0)
+        stub.run_interactive.assert_called_once_with(
+            35.5, -80.0, buffer_meters=None
+        )
+
+    def test_regenerate_map_skips_pipeline_and_calls_generate_report(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        # regenerate-map allows missing API key, but still needs the scored parquet present
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", None)
+        processed = tmp_path / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        scored = processed / "scored_locations.parquet"
+        scored.write_bytes(b"PAR1")  # sentinel; stubbed methods never read it
+        monkeypatch.setattr(pipeline_mod.config, "DATA_DIR", tmp_path)
+
+        rc = pipeline_mod.main(["--regenerate-map"])
+        assert rc == 0
+        stub._run_validate_results.assert_called_once()
+        stub._run_generate_report.assert_called_once()
 
     def test_legacy_dry_run_flag_still_works(
         self, monkeypatch: pytest.MonkeyPatch
@@ -357,6 +411,36 @@ class TestModeFlag:
         rc = pipeline_mod.main(["--csv", "fake.csv", "--dry-run"])
         assert rc == 0
         stub.run.assert_not_called()
+
+    def test_interactive_address_geocoding_resolves_coordinates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(pipeline_mod, "_ensure_rasters", lambda _csv: True)
+        monkeypatch.setattr(pipeline_mod, "_geocode_address", lambda _addr: (35.0, -80.0))
+
+        rc = pipeline_mod.main(["--mode", "interactive", "--address", "Charlotte, NC"])
+        assert rc == 0
+        stub.run_interactive.assert_called_once_with(35.0, -80.0, buffer_meters=None)
+
+    def test_interactive_county_short_circuits_without_rasters(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _build_orchestrator_stub()
+        monkeypatch.setattr(
+            pipeline_mod, "PipelineOrchestrator", MagicMock(return_value=stub)
+        )
+        monkeypatch.setattr(pipeline_mod.config, "ANTHROPIC_API_KEY", None)
+        # If county mode accidentally touches rasters, this will fail the test.
+        monkeypatch.setattr(pipeline_mod, "_ensure_rasters", lambda _csv: False)
+
+        rc = pipeline_mod.main(["--mode", "interactive", "--county", "37135"])
+        assert rc == 0
+        stub.run_interactive_county.assert_called_once_with("37135")
 
 
 class TestSigintHandler:

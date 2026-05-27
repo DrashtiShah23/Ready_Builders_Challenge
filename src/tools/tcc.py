@@ -2,8 +2,18 @@
 ``fetch_tcc``: point-in-raster lookup for NLCD 2021 Tree Canopy Cover.
 
 Returns a continuous canopy density (0–100 %) for a single WGS84 coordinate.
-Used by the Environmental Data Agent (Phase 5) and exposed as the
-``fetch_tcc`` Claude tool (Phase 7).
+Used by the Environmental Data Agent (Phase 5) as an internal helper.
+
+Phase 7 design note
+-------------------
+The original build plan exposed ``fetch_tcc`` as a Claude ``tool_use``
+tool dispatched per row. The Phase 7 redesign lifted Claude's tool
+surface to five pipeline-level tools (``ingest_locations``,
+``sample_environment``, ``score_risk``, ``validate_results``,
+``generate_report``); ``fetch_tcc`` is now called *inside*
+``sample_environment``'s Python loop, never by Claude directly. See
+``AI_TOOLS.md`` § "Phase 7 — Claude Orchestrator architectural redesign"
+for the rationale.
 
 Design notes
 ------------
@@ -26,7 +36,8 @@ Design notes
   uses 255 as its NoData sentinel. We also defer to the dataset's own
   declared ``nodata`` value if it differs.
 - **Errors are returned, not raised.** A failure to sample one point
-  must not crash a batch of 50. Every error path returns
+  must not crash an enrichment batch (``RASTER_BATCH_SIZE = 50_000``
+  rows by default). Every error path returns
   ``{"tcc_pct": None, "tcc_missing": True, "reason": ...}``.
 """
 from __future__ import annotations
