@@ -141,15 +141,35 @@ SLOPE_MOD_THRESHOLD: float = 10.0    # 10–20° → score 0.5 (moderate)
 RISK_HIGH_THRESHOLD: float = 0.6
 RISK_MOD_THRESHOLD: float = 0.3
 
-# --- Raster Dataset URLs (versioned for reproducibility) ---
-CANOPY_RASTER_URL: str = (
-    "https://s3-us-west-2.amazonaws.com/mrlc/nlcd_tcc_conus_2021_v2021-4.zip"
-)
-LANDCOVER_RASTER_URL: str = (
-    "https://s3-us-west-2.amazonaws.com/mrlc/nlcd_land_cover_l48_2021_20230630.zip"
-)
-# DEM: tile-based, no single URL — downloaded per state bounding box
-# via the USGS National Map API. See src/data/downloader.py:download_dem_tiles.
+# --- Raster Dataset Sources -----------------------------------------------
+# Switched from the original MRLC S3 zip URLs to MRLC's WCS (OGC Web Coverage
+# Service) endpoint in May 2026 after the S3 bucket policy locked down
+# anonymous bulk-zip downloads (HTTP 403 on both
+# ``nlcd_tcc_conus_2021_v2021-4.zip`` and
+# ``nlcd_2021_land_cover_l48_20230630.zip``). The WCS service serves the
+# same source rasters (same provenance, same CRS, same year/version), and
+# lets the downloader request only the state subset it needs instead of
+# pulling the national 3 GB zip and using 0.4% of it. See
+# ``docs/data_sourcing.md`` § "MRLC bulk zips → WCS" for the full rationale
+# and ``AI_TOOLS.md`` § "Phase 8 follow-up — MRLC source migration" for the
+# decision log.
+MRLC_WCS_BASE: str = "https://www.mrlc.gov/geoserver/mrlc_download/wcs"
+MRLC_WCS_VERSION: str = "2.0.1"
+# Coverage IDs are taken verbatim from the WCS ``GetCapabilities`` document;
+# the prefix (``mrlc_download__``) and case are the server's, not ours.
+MRLC_TCC_COVERAGE_ID: str = "mrlc_download__nlcd_tcc_conus_2021_v2021-4"
+MRLC_LANDCOVER_COVERAGE_ID: str = "mrlc_download__NLCD_2021_Land_Cover_L48"
+
+# Both NLCD coverages are served in EPSG:5070 (NAD83 Conus Albers, metres).
+# Bbox subsets sent over WCS must be in this CRS, so the downloader transforms
+# user-supplied WGS84 bboxes once per call before issuing the GetCoverage.
+NLCD_RASTER_CRS: str = "EPSG:5070"
+
+# DEM: tile-based, no single URL — downloaded per bounding box via the USGS
+# National Map API. The original ``polyType=state&polyCode=<FIPS>`` filter
+# stopped working in May 2026 (returns geographically wrong tiles, e.g.
+# Oregon for ``polyCode=37``); the downloader now uses the bbox filter,
+# which is the API path TNM's own viewer uses internally.
 
 # --- CSV ingestion contract ---
 EXPECTED_CSV_COLUMNS: list[str] = ["location_id", "latitude", "longitude", "state", "county"]
@@ -181,3 +201,23 @@ STATE_FIPS_TO_ABBR: dict[str, str] = {fips: abbr for abbr, fips in STATE_FIPS.it
 # --- USGS National Map endpoints (versioned for reproducibility) ---
 TNM_API_BASE: str = "https://tnmaccess.nationalmap.gov/api/v1/products"
 TNM_DEM_DATASET: str = "National Elevation Dataset (NED) 1 arc-second"
+# TNM's bbox endpoint serves up to ``max`` items in a single page (default
+# 50, capped server-side around the low hundreds). For NC's ~3° × 9° bbox
+# the catalogue contains ~126 raw items (3+ vintages × ~38 land quads), so
+# the default 50 was clipping the western mountain quads off the page.
+# 200 captures the full NC catalogue with the dedupe-by-quad layer
+# downstream collapsing it to ~38 tiles. Server-side pagination via
+# ``offset`` is currently flaky (``total=0`` after the first page), so the
+# downloader uses one large request and dedupes by ``(round(min_lat),
+# round(min_lon))`` keeping the latest vintage per quad.
+TNM_PAGE_SIZE: int = 200
+
+# --- State bounding boxes (WGS84, lon_min, lat_min, lon_max, lat_max) -----
+# Used by the downloader to subset NLCD rasters via WCS and DEM tiles via
+# TNM bbox. NC's bbox is the one already encoded in the orchestrator's
+# geographic-sanity validation check. Other states added as they're brought
+# into scope (this dict starts at NC because the challenge dataset is
+# NC-only; extending to additional states is intentionally minimal change).
+STATE_BBOX_WGS84: dict[str, tuple[float, float, float, float]] = {
+    "NC": (-84.32, 33.75, -75.46, 36.59),
+}
