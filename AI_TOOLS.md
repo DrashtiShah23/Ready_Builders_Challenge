@@ -1,278 +1,122 @@
-# AI Tools Used
+# AI Tool Disclosure
 
-This project uses AI assistance for both runtime pipeline logic (Claude as the orchestrator agent) and development assistance (Cursor in the IDE). Every use is disclosed here per the challenge requirements.
+This file lists every AI tool used to build this project and the moments where I made a different call from what was suggested. The challenge asked for this disclosure. I have kept it readable for anyone reviewing the submission.
 
-| Tool | Purpose | Version |
-|---|---|---|
-| Claude `claude-sonnet-4-6` (Anthropic API) | Runtime: pipeline orchestration via the `tool_use` API. **One orchestration session of approximately 6 turns** per run, five pipeline-level tools (`ingest_locations`, `sample_environment`, `score_risk`, `validate_results`, `generate_report`). Reasons about each step's summary (data quality, missing-data rates, tier distribution, validation anomalies), decides whether to proceed, and writes the plain-English end-of-run summary. Per-location reasoning is preserved in `run_interactive` for single-coordinate queries (plus deterministic buffer search for lower-risk alternatives). | `claude-sonnet-4-6` |
-| Cursor | Development: IDE with AI assistance for code generation, refactoring, and documentation drafting under explicit prompts and human review. All AI-generated code was reviewed line-by-line before commit; the three divergence cases below are the ones where the generated code differed from the build plan in ways worth flagging. | latest |
+## Tools used
 
-**No other AI tools were used.** No GitHub Copilot, no ChatGPT, no Codex, no LangChain-style framework that hides LLM calls behind a Python facade. The runtime Claude calls go through the native `anthropic` Python SDK (a transport library, not an AI tool); every prompt sent to Claude during runtime lives in `src/agents/prompts/orchestrator_v1.txt` and is versioned in git.
+These are the only AI tools involved in this project.
 
-## Cases where I diverged from AI output
+<table>
+  <tr>
+    <th>Tool</th>
+    <th>What I used it for</th>
+  </tr>
+  <tr>
+    <td>Claude API claude-sonnet-4-6</td>
+    <td>The coordinating agent in the pipeline. After each processing step it reads a short summary and decides whether to continue or stop. At the end it writes the plain English findings report. It never sees the raw location data, only summaries of what each step produced.</td>
+  </tr>
+  <tr>
+    <td>Cursor</td>
+    <td>The coding assistant used throughout the build. It helped write code, refactor, and draft documentation. Everything it produced was reviewed before being committed.</td>
+  </tr>
+  <tr>
+    <td>Gemini</td>
+    <td>Generated the two architecture diagram images saved in the docs folder. Used only for image generation, not for any code or pipeline logic.</td>
+  </tr>
+  <tr>
+    <td>Claude Opus via Cursor</td>
+    <td>Used during the planning phase to think through the architecture before writing any code. Not used at runtime.</td>
+  </tr>
+  <tr>
+    <td>Claude interactive mode</td>
+    <td>When a user queries a single address the pipeline scores it in Python and then asks Claude to explain in plain English why that location received its risk level. Costs about $0.01 per query.</td>
+  </tr>
+</table>
 
-The two entries below are cases where Cursor's generated code deviated from the literal text of `MASTER_BUILD_PLAN.md`. I reviewed each change before accepting it; both are logged here for transparency rather than because either was rejected.
+No other AI tools were used. Not GitHub Copilot, not ChatGPT, not any framework that hides API calls behind a Python library.
 
-1. **Pydantic mutable-default syntax — `list[str] = []` vs `Field(default_factory=list)`** (Phase 1, `src/schemas/location.py`).
-   - The build plan specified the four schema list fields as bare `list[str] = []`. Cursor implemented them with `Field(default_factory=list)`.
-   - Both work in Pydantic v2 because v2 deep-copies mutable defaults per instance. `default_factory` is the idiomatic and unambiguous form, removes any ambiguity for a future Pydantic v1 reader, and is the pattern Pydantic's own docs recommend.
-   - Independence is explicitly verified by `tests/test_schemas.py::test_validation_flags_default_is_independent_per_instance` (mutating one instance's list does not leak into another).
-   - **Decision: kept Cursor's deviation.** Documented here because the source line differs from the literal build-plan text.
+## Where I made a different call
 
-2. **`NLCD_CLASS_NAMES` lookup added to `src/config.py`** (Phase 1).
-   - The build plan's Phase 1 spec for `src/config.py` did not include a code → class-name mapping. However, Phase 3's `fetch_land_cover` is required to return a `land_cover_class` string ("Evergreen Forest", "Developed, Low Intensity", etc.).
-   - Cursor proactively added a `NLCD_CLASS_NAMES` dict covering all 16 NLCD codes to `src/config.py` in Phase 1, so Phase 3 has a single source of truth and reviewers can audit the full mapping in one place.
-   - This is data, not logic — it belongs in config alongside the existing `FOREST_CODES` / `DEVELOPED_CODES` / `OPEN_CODES` lists. Putting it anywhere else would split the NLCD classification information across two files.
-   - **Decision: kept Cursor's addition.** Flagged here because it is a content addition not requested by the build plan.
+These are the moments where I changed direction during the build. Written in the order they happened. Each one shows how it started, what I built instead, and the reasoning.
 
-3. **`ds.sample(...)` over a cached file handle, instead of `src.read(1)[row, col]` on a fresh open per call** (Phase 3, `src/tools/tcc.py`, `src/tools/landcover.py`, and the slope read in `src/tools/elevation.py`).
-   - The build plan's literal `fetch_tcc` body opens the GeoTIFF on every call and uses `src.read(1)[row, col]`, which loads the full ~3 GB NLCD band into memory for a single-pixel answer. That would be unusable at 1M points — both memory-blowout and I/O-bound — and it directly contradicts the build plan's own Phase 5 design note: "rasterio file handles are expensive to open. We open each raster file ONCE per batch."
-   - Cursor implemented the equivalent corrected version: a module-level lazy-opened dataset cache, `ds.sample([(x, y)])` for the actual pixel read (which only reads the single tile that contains the point), and a public `_reset_cache()` helper so tests and pipeline shutdown can close handles cleanly.
-   - The two changes are semantically identical at the per-call level (same input → same output for a single point) but make batch-scale execution feasible. Without this change, Phase 5's "open file handles once per batch" design has nothing to bind to.
-   - **Decision: kept Cursor's deviation.** Flagged here because the source body materially differs from the literal Phase 3 code in `MASTER_BUILD_PLAN.md`, and because it's the largest implementation change I've made off-spec so far.
+**The CSV did not match the brief**
 
-## Phase 2 — Data Downloader decisions
+How it started: The ingestion code was built assuming the CSV would have explicit state and county columns as the challenge brief described.
 
-1. Streamed downloads write to a `.part` file and only get renamed to the final path once the byte stream finishes cleanly, because a Ctrl+C or dropped Wi-Fi mid-download otherwise leaves a half-written GeoTIFF that looks valid until rasterio tries to open it.
-2. The `download_dem_tiles` loop catches per-state errors instead of bubbling them up, because one flaky USGS response shouldn't be allowed to kill a 49-state run when the other 48 are happily downloading.
-3. Idempotency for DEM lives at the *tile* level rather than the state level, because USGS returns a dozen-plus 1°×1° tiles per state and a network blip mid-state should resume the missing tiles on the next run instead of re-downloading the whole state.
-4. Boundary pixels in the pre-computed slope raster are written as `-9999` NoData, not zero, because Horn's method genuinely cannot compute slope at a raster edge — calling that "flat" would silently misclassify the entire rim as low-risk terrain.
-5. I added `--skip-tcc`, `--skip-landcover`, and `--skip-slope` CLI flags beyond what the build plan asked for, because the bare `--states` flag still triggers ~6 GB of downloads, and I needed a way to smoke-test the CLI from pytest without burning bandwidth.
-6. `STATE_FIPS` is CONUS-only (no AK/HI/territories), because the Starlink install guide and the Ready challenge brief both target the lower 48 + DC, and adding a state later is a one-line config change rather than a code rewrite.
-7. DEM rasters are not downloaded during tests — the real integration test is the first manual `python -m src.data.downloader --states CA` run — because each tile is ~100 MB+ and pulling them on every test run would make the suite uselessly slow without testing anything that mocks + a synthetic GeoTIFF don't already cover.
+What I built: The real CSV had a 15-digit Census Block GEOID instead and I derived state and county from the first digits of that code automatically.
 
-## Phase 3 — Tools decisions
+The reasoning: The actual file is always the source of truth, not the spec.
 
-1. Each tool keeps its open rasterio dataset in a module-level cache and only reopens it when the underlying file path changes, because `rasterio.open` parses headers and allocates buffers — doing that on every call at 1M points would dominate runtime.
-2. Aspect is computed per-point from a 3x3 windowed DEM read rather than pre-computed in Phase 2, because Phase 2 is already merged and the v3.0 scoring formula doesn't use aspect in the composite (only Claude's anomaly-reasoning does), so the per-point cost is acceptable and the alternative would have meant reopening Phase 2's downloader.
-3. The DEM handle cache is LRU-capped at 16 open files instead of holding every tile open, because a 49-state CONUS run can produce hundreds of tiles and the OS file-descriptor table is not generous enough to hold them all simultaneously.
-4. Unknown NLCD codes return `"Unknown (<code>)"` as the class name rather than raising or returning `None`, because dropping the raw integer would lose information that the analysis report and Claude's anomaly check both find useful — the value is still flagged via the class string.
-5. The NoData sentinel for TCC is hard-coded as 255 *and* falls back to the dataset's declared `nodata` field, because the NLCD docs publish 255 as the canonical TCC NoData but the GeoTIFF metadata occasionally disagrees, and a missing-data classification should not depend on which source is correct.
-6. TCC values outside [0, 100] are flagged as missing rather than passed through, because the NLCD legend caps canopy density at 100% and any out-of-range value indicates either a misinterpreted byte or corrupted sample — silently feeding garbage into the scoring formula would be worse than logging a clear flag.
-7. Each tool exposes a `_reset_cache()` helper, because tests need to swap raster fixtures between cases without leaked file handles, and the pipeline's shutdown handler (Phase 8) needs a single clean exit point that releases every open dataset.
+**Risk weights had to come from somewhere real**
 
-## Phase 4 — Ingestion Agent decisions
+How it started: Equal weights of 33% for all three scoring factors seemed reasonable since no calibration data existed.
 
-1. Validation runs in a deliberate order — `location_id` → dedup → null coords → Pydantic → CONUS bbox → state — because each check is positioned to give the most precise reason code possible (e.g. an obviously-null coordinate gets `NULL_COORDINATE` instead of the more generic `PARSE_ERROR` that a Pydantic-first ordering would emit).
-2. An invalid `state` value drops the row rather than nulling the field, because the build plan lists `INVALID_STATE` in its drop-reasons list and silently coercing a bad state would let upstream data-quality issues hide instead of surfacing in the per-reason summary.
-3. A single `_is_null` helper centralises the "what counts as missing" definition across `None`, `pandas.NA`, `float("nan")`, and whitespace-only strings, because CSVs ingested from different sources express missingness differently and inconsistent handling would let some null variants leak through unflagged.
-4. Each chunk is converted to dicts via `chunk.to_dict(orient="records")` rather than `itertuples`, because `to_dict` is slightly slower but eliminates the column-presence edge cases that `itertuples` named-tuple access introduces when an optional column is absent.
-5. The `run` generator wraps its body in `try/finally` so the `INGESTION_SUMMARY` event is logged even when a downstream consumer abandons iteration partway through, because a half-finished pipeline run is exactly when you most want to know the partial drop counts.
-6. Batch IDs are monotonic `batch-NNNNNN` strings stamped at validation time, because tracing one bad record from the input CSV through the orchestrator log requires a stable identifier that all rows in the same batch share and the build plan's spec for `ValidatedLocation.batch_id` is a `str`.
-7. State values are normalised to canonical upper-case before being written into `ValidatedLocation`, because the USGS API and the downstream Parquet partition key both expect `"CA"`-style abbreviations and a mix of `"CA"` / `"Ca"` / `"ca"` would fragment partitions and break joins.
-8. Optional `state` and `county` columns are backfilled with null if absent from the CSV (instead of raising), because the build plan's `EXPECTED_CSV_COLUMNS` is documented as "expected" not "required" and a CSV that only ships `location_id, latitude, longitude` should still ingest cleanly — every other field is enrichment, not validation.
+What I built: Canopy at 50%, terrain slope at 30%, and land cover at 20%, taken directly from the Starlink install guide which names tree branches as the primary obstruction.
 
-## Phase 5 — Environmental Agent decisions
+The reasoning: Equal weights are a guess dressed up as a decision and every weight needs to trace back to a source document.
 
-1. The agent calls each tool module's private `_ensure_dataset` / `_build_dem_index` once per batch via a `_warm_caches` step instead of letting the tools open lazily on the first row, because explicit cache-warming surfaces a `CACHE_WARMED` event in the JSONL log with the per-dataset open status — which makes it observable that the build plan's "open file handles ONCE per batch" intent is actually being enforced, not just happening accidentally.
-2. `SLOPE_MISSING` is logged as a separate flag from `ELEVATION_MISSING` even though both come from the same `fetch_elevation` call, because the v3.0 scoring formula uses slope (terrain weight = 30%) but does not use raw elevation, so the two missing-data populations have different downstream blast radius and a reviewer auditing scoring drop-outs needs to filter on the slope flag specifically.
-3. `ASPECT_MISSING` is emitted alongside the other missing flags despite being ambiguous (null can mean "fetch failed" or "genuinely flat terrain"), because the alternative — silently nulling aspect — would lose the fact that the agent did attempt to read it, and the ambiguity is documented in the agent's module docstring so a reviewer sees the caveat next to the flag.
-4. A `FETCH_EXCEPTION` flag is added on top of the per-tool missing flag whenever a tool raises (not returns) an error, because the Phase 3 tools are written never to raise, so if one ever does it's a real bug and the flag is what makes that bug visible in a 1M-row run instead of being swallowed by the per-row try/except.
-5. The agent imports the tool modules (`tcc_mod`, `landcover_mod`, `elevation_mod`) by alias and references their private `_ensure_*` helpers directly, because the alternative — adding a `warm()` public method to each tool — would mean three more API surfaces to keep stable when the only legitimate caller is this one agent. The coupling is explicit and one-directional, and `tests/test_environmental.py` proves the patch target is stable.
-6. `enrich_batch` returns the empty list (and logs an `EMPTY_BATCH` event) without warming caches when handed `[]`, because the orchestrator may legitimately emit an empty trailing partial batch from ingestion, and warming + an empty `ENRICH_BATCH_DONE` event would just be noise in the log.
-7. Cumulative per-signal missing counts and rates are tracked on the agent instance and exposed via `log_run_summary`, because the orchestrator (Phase 7) needs an end-of-run snapshot of data-quality across every batch — and pushing that responsibility into the orchestrator would mean either re-walking every batch's log entry or duplicating the counter logic, both of which are worse than letting the agent own the rollup of its own work.
+**Downloading 3 GB to use 0.4% of it**
 
-## Phase 6 — Risk Scoring decisions
+How it started: The design downloaded full national NLCD raster files at about 3 GB each and used a state code parameter for elevation tiles that was silently returning results from Oregon.
 
-1. The composite is rounded to 4 decimal places *inside* `score_components` *before* being handed to `tier_for`, because the natural outputs of the formula (combinations of weights × bucket scores) hit clean values like 0.6 exactly in math but can drift to 0.6000000000000001 in IEEE 754 — and an un-rounded 0.6 + 1e-16 would flip a borderline location into "High" by an invisible epsilon.
-2. `tier_for` itself does NOT round its input, because the STOP-gate boundary test (0.599 → Moderate, 0.600 → High) calls `tier_for` directly with hand-crafted boundary values and rounding inside the comparator would corrupt that test surface — the rounding belongs at the composite-computation step, not the tier-mapping step.
-3. Non-classified NLCD codes (11 Open Water, 12 Ice/Snow, 90/95 Wetlands, and any unknown integer) score 0.0 AND emit a `LANDCOVER_UNHANDLED_CODE` flag, because silently lumping them with `OPEN_CODES` would lose the audit trail and silently raising would break partial scoring — TCC already captures any canopy density at wetland sites, so the 0.0 default isn't lying so much as deferring to TCC for that signal.
-4. Slope-missing uses the flag name `SLOPE_MISSING` (matching Phase 5's `EnvFlag.SLOPE_MISSING`) rather than the build plan's literal `ELEVATION_MISSING` text in the Phase 6 spec, because the two phases need a single coherent flag vocabulary for `ScoredLocation.all_flags` and using two different names for the same condition would force every downstream consumer to alias them anyway.
-5. The agent exposes both `score_components(...)` (returns a plain dict) and `compute_risk_score(enriched)` (returns a full `ScoredLocation`), because Phase 7's Claude tool dispatcher needs a JSON-serialisable return value to hand back as `tool_result` content, but the orchestrator's non-Claude fallback path needs the full Pydantic object straight away — and a single function couldn't cleanly serve both.
-6. `score_components` accepts a `latitude` keyword argument that the v3.0 formula ignores, because Phase 7's Claude tool schema declares latitude as a required input for forward compatibility with hemisphere-aware scoring (south-facing CONUS dishes need slope/aspect orientation context) and the agent and Claude tool surfaces must match.
-7. The three bucket-output scores are named `_SCORE_HIGH / _SCORE_MODERATE / _SCORE_LOW` even though they're just `1.0 / 0.5 / 0.0`, because (a) naming the buckets disambiguates them from the configurable weights in the source (otherwise `0.5` could mean either `TCC_WEIGHT` or the moderate bucket) and (b) it lets the regression test `test_no_hardcoded_thresholds_in_scoring_module` scan the executable code for accidental weight literals without false-positives on the bucket values.
-8. `ScoredLocation.all_flags` is order-preserved-deduplicated with env flags BEFORE scoring flags, because a reviewer reading the flag list cares first about what the upstream data-quality state was (env_fetch_flags) and only then about what the scoring engine itself flagged — and `set()` + sorting would scramble that storyline.
+What I built: Switched to the MRLC WCS endpoint requesting only the NC bounding box at about 50 MB and fixed the elevation download by switching to a bounding box query.
 
-## Phase 7 — Claude Orchestrator architectural redesign
+The reasoning: The broken URLs forced the better decision but downloading 3 GB to use 0.4% of it was already wrong.
 
-Before implementing Phase 7 I changed the agent design that was in the build plan. The change is large enough to warrant its own section.
+**Computing terrain slope once not four million times**
 
-**Original design (replaced):** Claude reasons per batch of ~100 locations, calling `fetch_tcc`, `fetch_elevation`, and `compute_risk_score` once per row. At 4.67M rows that would mean ~46,700 Claude calls and roughly $10,600 in API spend, which is incompatible with running the full North Carolina dataset that ships in `data/locations.csv`.
+How it started: The straightforward approach reads a 3x3 window of elevation pixels around each location at query time to compute slope on the fly.
 
-**New design (implemented):** Claude runs **one orchestration session of approximately 6 turns** per pipeline run (the `tool_use` loop). It is given five pipeline-level tools — `ingest_locations`, `sample_environment`, `score_risk`, `validate_results`, `generate_report` — and each tool internally runs the full dataset through the existing Phase 1-6 agents (none of `ingestion.py`, `environmental.py`, `scoring.py`, `tcc.py`, `elevation.py`, or `landcover.py` was modified). Claude reasons about each step's summary (valid_pct, missing-data rates, tier distribution, validation anomalies), decides whether to proceed, and writes the plain-English end-of-run summary. Total cost: under $1 for the full 4.67M-row dataset.
+What I built: Precomputed the entire slope raster once from the DEM tiles before the pipeline runs so every location lookup reads one pixel from that file.
 
-Decisions tied to the redesign:
+The reasoning: Computing slope per point at 4.67 million locations means 4.67 million windowed reads against a compressed multi-gigabyte file and precomputing once turns that into one operation.
 
-1. **Per-location Claude reasoning is preserved in interactive mode only.** `PipelineOrchestrator.run_interactive(lat, lon)` is the one path where Claude sees an individual location — it costs ~$0.01 per query and demonstrates the "user gives coordinates, agent explains sky visibility" agentic scenario from the challenge brief at a cost shape that makes sense for one-off queries. Applying that same per-location call pattern at 4.67M rows is what the redesign is replacing.
+**One orchestrator not five separate agent classes**
 
-2. **The five tools each persist their output to parquet** (`data/processed/validated_locations.parquet`, `enriched_locations.parquet`, `scored_locations.parquet`). The next tool reads the previous tool's parquet, so Claude only ever sees JSON summaries — never individual rows. That is the whole point: Claude's reasoning lives at the level where it can move the needle (data quality calls, anomaly flagging, distribution sanity checks), and the per-row work stays in deterministic Python.
+How it started: The natural design would have been five separate agent classes each with their own Claude client, one per pipeline step.
 
-3. **Four validation checks fire between scoring and reporting**: distribution sanity (>80% in any one tier flags a threshold calibration issue), cross-validation (forest-classified pixels with `tcc_pct < 10` flagged as likely clear-cut / data-vintage mismatch), geographic sanity (rows outside the NC bounding box halt the pipeline), and missing-data rate (any single signal >15% missing flags as a warning). Geographic-sanity failure is the only check that halts the pipeline; the other three degrade status to "warnings" and surface in the report.
+What I built: One orchestrator with five tools where each tool has a defined scope and data contract enforced by Pydantic schemas.
 
-4. **`MAX_AGENT_TURNS = 20` bounds the tool call loop.** If Claude never returns `end_turn`, the loop exits cleanly with a `MAX_TURNS_REACHED` log event rather than spinning forever. The cap is intentionally generous — at five real tool calls plus a few clarification turns the budget is far below 20 — so a healthy run never hits it but a pathological prompt-injection scenario can't run the bill up.
+The reasoning: The pipeline is sequential with no parallel branches so multiple agent classes add coordination overhead without any analytical benefit.
 
-5. **`CLAUDE_BATCH_SIZE` was removed from `src/config.py`** because the new design no longer reasons per batch of locations. The legacy `IngestionAgent.run()` default-fallback path that referenced it is unused — the orchestrator always passes `batch_size=config.RASTER_BATCH_SIZE` explicitly — but per Phase 7's "do not touch ingestion.py" guidance the docstring in `ingestion.py` was left stale and the contract was documented in this file instead. _(Phase 12 follow-up: the default fallback was updated to `config.RASTER_BATCH_SIZE` and the docstring corrected, since standalone REPL / notebook use of the ingestion agent would otherwise crash on `AttributeError`. Every existing test passes `batch_size` explicitly, so the change is internal-only.)_
+**Finding nearby alternatives is math not AI**
 
-6. **System prompt versioned at `src/agents/prompts/orchestrator_v1.txt`** rather than hardcoded in Python, so prompt revisions are reviewable in git diffs and the prompt artifact is auditable separately from the loader.
+How it started: The buffer search returning nearby lower-risk locations could have been a Claude tool call letting the agent reason about which alternatives to suggest.
 
-7. **Cost projection is documented in `src/config.py`** alongside the agent config block so a reviewer reading the constants sees the redesign's economic basis without having to dig through this file.
+What I built: A deterministic haversine distance query over the scored parquet file with no Claude call involved.
 
-## Phase 8 follow-up — MRLC source migration
+The reasoning: Finding the three nearest points with lower risk scores is a spatial math problem and calling Claude for it adds latency and cost for zero reasoning benefit.
 
-After Phase 8 was merged, the downloader had to be patched before Phase 9 could run because two of its data sources broke since the code was originally written:
+**The map failure should not kill the report**
 
-1. **MRLC S3 bulk zips return HTTP 403 `AccessDenied`** for both `nlcd_tcc_conus_2021_v2021-4.zip` and `nlcd_2021_land_cover_l48_20230630.zip`. The MRLC bucket policy locked down anonymous bulk-zip downloads. Verified with both `httpx` and `curl`, with and without a browser User-Agent and a `Referer: mrlc.gov` header. The mrlc.gov-hosted mirror at `/downloads/sciweb1/shared/mrlc/data-bundles/...` returns 404.
+How it started: When the map rendering step failed the pipeline stopped entirely and no outputs were written.
 
-2. **USGS TNM API `polyType=state&polyCode=<FIPS>` filter is non-functional.** `polyCode=37` (NC FIPS) returns ~200 tiles all in Oregon/Idaho; `polyCode=06` (CA) returns 0 tiles; `polygonCode=NC` returns 6618 tiles starting in Hawaii. Probed multiple parameter naming variants — every one was either ignored, returned non-JSON, or returned geographically wrong results. The TNM `bbox` filter still works correctly.
+What I built: Map failure is non-fatal, the pipeline logs a MAP_RENDER_FAILED event and continues, and the analysis report and parquet summaries always generate.
 
-**Decision: migrate both, document, ship before Phase 9.**
+The reasoning: The data outputs are the primary deliverable and a visualization bug should never prevent the findings from being written.
 
-For NLCD I switched from the bulk-zip path to MRLC's WCS (OGC Web Coverage Service) at `https://www.mrlc.gov/geoserver/mrlc_download/wcs`. This is the same dataset family (same source, same year, same version, same EPSG:5070 CRS) but served as a queryable coverage instead of a 3 GB national zip. For the NC use case the WCS NC subset is ~50-150 MB per layer instead of 3 GB — we now download 4 % of the bytes we used to. The migration is *also* a real architectural improvement independent of the bucket lockdown:
+**The county filter needed a complete rebuild**
 
-* **Right-sized payloads.** The WCS server does the subsetting; we no longer pull the national raster to use 0.4 % of it.
-* **No zip extraction.** WCS returns a TIFF directly. The `_extract_zip` helper is gone, along with the whole class of "zip contained nothing readable" failures.
-* **State-scoped reruns are cheap.** Adding a state means adding a row to `config.STATE_BBOX_WGS84` and rerunning the downloader with that state — the existing TIFFs for other states stay put.
-* **OGC-standard interface.** WCS is the same path MRLC's own viewer uses internally, so it's the least-likely-to-disappear option going forward.
+How it started: The county filter used GeoJSON properties to show and hide markers with JavaScript and after two attempts to fix it the filter still did not work.
 
-For DEM I switched from `polyType=state&polyCode=<FIPS>` to `bbox=lon_min,lat_min,lon_max,lat_max`. The bbox is derived from `config.STATE_BBOX_WGS84` — the same NC bounding box (`-84.32, 33.75, -75.46, 36.59`) the orchestrator's geographic-sanity validation check already uses. Two TNM-shaped knobs to call out:
+What I built: Scrapped the GeoJSON approach entirely and switched to a separate Folium FeatureGroup per county that swaps the entire layer on dropdown change.
 
-* **Page size.** TNM's `max` parameter defaults to 50 but the server happily returns a couple hundred items in a single response. NC has ~126 raw catalogue entries (3+ vintages × 38 land quads), so the default 50 silently clipped the western mountain quads off the page. The downloader requests `max=200` (`config.TNM_PAGE_SIZE`) so the full state catalogue arrives in one shot, then dedupes by 1° quad keeping the latest vintage. Server-side pagination via `offset` is currently broken (`total=0` after the first page), so one large request is the cleanest path.
-* **Transient failures.** Three observed flavours: HTTP 5xx, HTTP 200 with non-JSON Python-repr bodies, and HTTP 200 with valid JSON but `items: []`. All three retry up to 5 times with a 3-second backoff. The empty-items-as-transient heuristic is opt-out via `_treat_empty_as_transient=False` for callers that legitimately query empty bboxes.
+The reasoning: Sometimes the first approach is architecturally wrong and needs replacing not patching.
 
-Latent bug surfaced + fixed in the same patch: `precompute_slope_raster` was passing the DEM's raw pixel size (`mosaic_transform.a` ≈ 0.000278°) to Horn's method even though the elevation values are in metres. On geographic-CRS DEMs (EPSG:4269 for 3DEP) this made every slope blow up to ~89.99°. The old unit test passed because the synthetic DEM used a unit cellsize and a unit elevation step, which made the bug invisible. The downloader now detects `crs.is_geographic`, converts the pixel size to metres at the raster's centre latitude (`111_320 × cos(lat_centre)` east-west, `111_320` north-south), and logs both raw and converted cell sizes. Validated on real NC data: Raleigh median 2.5°, Cape Hatteras 0.05°, Wilmington 0.8° — physically plausible. A new regression test runs a geographic-CRS synthetic DEM through the kernel and asserts the median slope is in the physically expected range.
+**Seasonal risk should advise not change the score**
 
-Touched files (small surgical patch in `feature/fix-downloader-sources` ahead of Phase 9):
+How it started: The natural approach would adjust the stored composite risk score by season, lowering it in winter when deciduous trees shed their leaves.
 
-* `src/config.py` — removed `CANOPY_RASTER_URL` / `LANDCOVER_RASTER_URL`; added `MRLC_WCS_BASE`, `MRLC_WCS_VERSION`, `MRLC_TCC_COVERAGE_ID`, `MRLC_LANDCOVER_COVERAGE_ID`, `NLCD_RASTER_CRS`, `TNM_PAGE_SIZE`, and `STATE_BBOX_WGS84`.
-* `src/data/downloader.py` — rewrote TCC/LC fetch around `_download_wcs_coverage` (WGS84→EPSG:5070 projection, WCS GetCoverage, atomic streaming write). Replaced `_tnm_query_state` with `_tnm_query_bbox`. Added `_dedupe_tiles_latest_vintage` to handle TNM's same-quad/multiple-vintages output. Dropped the zip-extraction code path entirely. `download_tcc` and `download_landcover` now take an optional `states` list and encode it into the output filename (`..._NC.tif`) so multi-state runs don't collide.
-* `tests/test_downloader.py` — replaced zip-extraction tests with WCS-request-shape assertions, replaced polyCode tests with bbox-query tests, added coverage for `_states_to_bbox_wgs84`, `_project_bbox_to_5070`, and `_dedupe_tiles_latest_vintage`.
-* `docs/data_sourcing.md` — documented both migrations under their own headings ("MRLC bulk zips → WCS" and "TNM `polyType=state` → `bbox`"), updated the version pins section to use the new WCS coverage ids.
+What I built: One stored score per location based on peak summer canopy with a seasonal advisory note returned in interactive mode for deciduous and mixed forest locations.
 
-Trade-off worth noting: the WCS server occasionally omits `Content-Length` (chunked encoding). `tqdm` degrades to "unknown total" gracefully but the progress bar shows only bytes-so-far, not a percentage. Acceptable given the alternative (a broken downloader). Logs still record `bytes_written` in the `HTTP_DOWNLOAD_DONE` event so a reviewer auditing a run can see the exact size that was pulled.
+The reasoning: Two different scores for the same location would break every comparison and county ranking.
 
-## Phase 8 — State store and pipeline runner
+**Monitoring from your own logs not a third party**
 
-Phase 8 was reinterpreted under the Phase 7 redesign — the original per-batch checkpoint loop no longer exists, so the deliverables had to be re-shaped while preserving the spirit (state store, DuckDB analytics, resumability, `--states` filter, clean shutdown).
+How it started: The obvious approach for observability was LangSmith or a separate monitoring agent.
 
-1. **Partitioned state store at `outputs/scored/state={STATE}/part-0.parquet`** is the canonical analytics surface, but the orchestrator continues to write a single-file intermediate at `data/processed/scored_locations.parquet` because the downstream validate/report tools read it directly. Both writes happen in `_run_score_risk` — the duplication is cheap (one extra parquet write per run) and avoids forcing the downstream tools to use DuckDB / partition globs just to load the data they already had in memory upstream.
+What I built: metrics.py parses the structured JSONL logs the pipeline already writes and covers every monitoring item the challenge asked for including per-step success rates, latency, token usage, estimated cost, tool call accuracy with four signals, scored location percentage, and a quarterly drift detection strategy documented in decision_log.md.
 
-2. **DuckDB queries always use an explicit `state=*/*.parquet` glob** rather than a directory scan. Sibling summary parquets (`risk_summary_by_state.parquet`, `risk_summary_by_county.parquet`) live at the same `outputs/scored/` root, and any reader that does `pd.read_parquet(dir)` would silently include them as part of the partitioned dataset. The glob form was tested explicitly (`tests/test_store.py::TestReader::test_sibling_summary_parquets_are_ignored`) because this was a real bug we hit during implementation.
+The reasoning: The pipeline already logs everything it does and routing that data through a third-party service adds a dependency for no benefit.
 
-3. **`--resume` works at the parquet-step level, not per-batch.** The original Phase 8 spec called for per-batch checkpoints; the redesigned Phase 7 has no per-batch loop to checkpoint between. Instead, each `_run_*` method checks if its output parquet already exists at the start of the call and returns a synthetic "RESUME" summary built from that parquet if so. Claude sees the summary, reasons about it, and moves on to the next tool. A pipeline that crashed during enrichment can be restarted with `--resume` and skip the hours of raster work it had already completed.
-
-4. **`--states` filter is applied post-validation, not inside `IngestionAgent`.** Phase 4's tested ingestion logic is in the "do not touch" set; threading the filter into `IngestionAgent.run` would have meant a Phase 4 contract change. Instead the orchestrator drops the non-matching rows from each yielded batch before extending the running list. Functionally identical, surface-stable for ingestion.
-
-5. **`PIPELINE_CHECKPOINT` events fire after each parquet write.** A stable event name (rather than re-purposing `TOOL_CALL`) gives Phase 11's metrics module a single thing to scan for to compute per-step latency and to detect crashed runs (a checkpoint for step N but not step N+1). The events also carry `resume_eligible: true` so a future smarter resume logic can distinguish "this artifact is safe to reuse" from "this artifact was abandoned".
-
-6. **`--mode {batch,interactive,dry-run}` is now the canonical mode selector.** The legacy `--interactive` and `--dry-run` booleans from Phase 7 still work as aliases (the legacy switches win over `--mode` when both are set, mirroring the Phase 7 behaviour). This keeps Phase 7 documentation and any in-flight tooling unbroken while giving Phase 8+ docs a single coherent flag.
-
-7. **Ctrl+C handling is at the top of `main()`, not inside the orchestrator.** A `SIGINT` handler is installed before any work starts; it emits a `PIPELINE_INTERRUPTED` event and re-raises `KeyboardInterrupt`, which the top-level `try/except` in `main()` converts to exit code 130 (POSIX convention: 128 + SIGINT). The orchestrator never has to know about signals — keeps its surface narrow and makes it trivially unit-testable.
-
-8. **Null-state rows go to `state=UNKNOWN/`** in the partition store rather than being dropped. Phase 4 only emits `state=None` when geoid_cb derivation explicitly failed, so surfacing that population as its own partition is part of the data-quality story rather than something to hide.
-
-9. **`get_top_at_risk_counties(min_locations=25)` has a default size floor** to suppress statistically meaningless county-level pcts. One High row out of two locations is not a "high-risk county"; 25 is small enough to keep most real rural counties and large enough to drop the noise. The parameter is exposed so callers with denser samples can lower it.
-
-10. **`pyarrow` was added as an explicit dependency** even though pandas pulls it transitively when writing parquet. The store writer passes `engine="pyarrow"` explicitly to ensure deterministic behaviour across pandas builds (some default to `fastparquet`, which doesn't fully support all the dtype round-trips we rely on).
-
-## Phase 9 — Analysis report
-
-The report tool is the closing deliverable a state broadband officer actually reads. Every number in it had to be defensible, every section had to match the Phase 9 STOP-gate checklist, and the wiring had to keep the prior eight phases working untouched.
-
-1. **DuckDB drives every aggregation, not a second pandas implementation.** The Phase 8 partition store and its query helpers (`get_risk_distribution`, `get_state_breakdown`, `get_county_breakdown`, `get_top_at_risk_counties`) are the same SQL paths an analyst would query interactively, so the report's numbers and the queryable store's numbers can never drift. The earlier pandas `_tier_summary` helper was deleted rather than left as a parallel path — one source of truth or none.
-
-2. **`get_county_breakdown` is the full-list cousin of `get_top_at_risk_counties`.** The latter applies a `min_locations` floor (default 25) so single-row counties don't dominate the rankings; the former is unfiltered so the per-county summary parquet contains every cell. Both queries share the same column shape so a downstream consumer can swap one for the other without re-parsing the schema.
-
-3. **The report writes its own per-state and per-county summary parquets** at `outputs/scored/risk_summary_by_*.parquet`. These sit *alongside* the partitioned store rather than inside it (Phase 8's `state=*` glob ignores them by design). Pre-computing the aggregates as parquet means the Phase 10 interactive map and any future API endpoint can consume the same numbers without re-running the DuckDB queries.
-
-4. **Each `_run_*` handler caches its own summary on `self._tool_summaries`.** A tiny `_remember_summary(name, summary)` helper wraps every return path (including the resume short-circuits) so by the time `_run_generate_report` runs, the ingestion and environmental-enrichment summaries are in memory for the Data Quality section. Reaching back through these cached objects beats re-deriving missing-data rates and validation drop counts from the on-disk parquets.
-
-5. **Executive summary opens with the prescribed sentence pattern** from the build plan (`"Of the [N] locations committed for LEO satellite service…"`). A grep-stable opening sentence is the deliberate choice — evaluators (human and automated) can confirm the report shape without parsing prose. The rest of the summary is plain English; no formulas, no weights, no jargon. Those live one section down in Methodology.
-
-6. **Data Quality is split into three subsections** (Ingestion / Environmental Sampling / Post-Scoring Validation) rather than one prose paragraph. State broadband officers need to scan: *how many rows were dropped, why, and was the remaining environmental coverage good?* — three orthogonal questions deserve three orthogonal tables. Zero-count reasons are suppressed from the ingest exclusions table to keep it scannable.
-
-7. **Methodology pulls every threshold from `config.py` at render time.** Re-tuning a weight or threshold in config flows directly into the next regenerated report; the report never hard-codes a number the source of truth could disagree with. Dataset version pins (NLCD coverage IDs, USGS 3DEP DEM specifier, geoid_cb) are also rendered from config so a future MRLC vintage bump only touches one file.
-
-8. **Known Limitations is rooted in `docs/analysis_rationale.md`** § 4 ("What this analysis is not measuring"). Surfacing the same caveats up-front in the report is the operational difference between a "score" and a "score the user can act on"; the limitations section closes with the explicit `High → priority site assessment, not unserviceable; Low → best available remote assessment, not a guarantee` framing so a reader who only reads the first and last sections still leaves with the right mental model.
-
-9. **Map render failures are non-fatal.** The folium `_render_map` call is wrapped in a try/except that logs a `MAP_RENDER_FAILED` event and continues. The markdown + parquet summaries are the *primary* deliverables; the interactive HTML map is a nice-to-have, and a headless-environment matplotlib quirk or a missing dependency must never block the run.
-
-10. **The Generated Artifacts section uses paths relative to the project root when possible, absolute paths otherwise.** Test fixtures that monkeypatch `SCORED_DIR` and `_OUTPUTS_DIR` to a tmp dir outside the project root would otherwise raise `ValueError` on `Path.relative_to`; the relativization is best-effort so the same code works in both prod and tests.
-
-## Phase 10 — Interactive map
-
-The map is the second-most-touched deliverable after the report itself — a state broadband officer who clicks through a million locations needs the map to surface what the markdown can only describe. Phase 10's decisions all point at making the map *useful* for that workflow rather than just "present".
-
-1. **`_render_map` stays inside `PipelineOrchestrator` rather than moving to `src/agents/output.py`.** The Phase 10 spec text references `src/agents/output.py`, a file that the Phase 7 redesign collapsed away — every per-pipeline-step concern moved into the orchestrator's `_run_*` methods. Creating a one-method file just to match the original phase's organizational guidance would obscure the call site (`_run_generate_report` already invokes `_render_map`) without buying anything. The map is one component of report generation, so it lives with the report code.
-
-2. **Tier hex codes are the exact spec values, not Leaflet's named colours.** The previous Phase 9 stub used the Leaflet shorthand `"red"` / `"orange"` / `"green"`; Phase 10 swaps in `#e74c3c` / `#f39c12` / `#2ecc71` so a screenshot is consistent across browsers (Leaflet's named colours are aliases that resolve differently in different builds). Constants live at the top of `orchestrator.py` so re-theming the map (high-contrast mode, colour-blind variant) is a single-file change.
-
-3. **UNSCORED rows are filtered out of the map, not painted in grey.** An UNSCORED row has no position on the risk spectrum — its environmental data was unavailable. Painting it any colour suggests "we put it somewhere on the High/Moderate/Low spectrum and you should trust that placement". UNSCORED locations belong in the report's Data Quality Summary table, not on the risk map, and `_sample_for_map` enforces this before the marker budget is allocated.
-
-4. **`MarkerCluster` with `disableClusteringAtZoom=8` is the spec's "marker clustering at zoom < 8" requirement, literally.** Zoom 8 is the level where a typical US-state view starts resolving individual blocks; below it the user is looking at a regional summary and clusters communicate density better than overlapping circle markers. Above zoom 8 the clusters dissolve so a reviewer can click a specific marker for its tooltip without first untangling a cluster's child count.
-
-5. **One `FeatureGroup` per tier, all defaulting to `show=True`.** Phase 10's STOP gate requires "layer toggles work for each risk tier" — and a reviewer's primary "show me only at-risk locations" workflow needs the High/Moderate toggle to be one click away. `LayerControl(collapsed=False)` keeps the toggles visible by default rather than tucked behind a hamburger button; the default-on behaviour for every tier matches the report's "everything is present, the reviewer chooses what to focus on" stance.
-
-6. **Subsample cap raised from 5 000 (Phase 9) to 50 000.** With raw circle markers in a Leaflet DOM the original 5 000-point cap was the right call — past that the browser locked up. With `MarkerCluster` doing the heavy lifting, 50 000 markers render smoothly on a typical laptop because most of them collapse into a couple dozen cluster bubbles at any given zoom level. At the full-dataset 4.67 M-row scale this still bounds the rendered DOM size; the cap is a tunable in `orchestrator.py` so a deployment with a beefier review machine can dial it higher.
-
-7. **Subsampling is tier-stratified with spare-budget redistribution, not uniform.** A naive uniform subsample on a 60% Low / 35% Moderate / 5% High dataset would push High markers below visibility on the map. The stratified scheme allocates 40% / 35% / 25% by tier, then redistributes any tier's unused slots (because that tier has fewer rows than its allocation) to the still-hungry tiers, High first. So a state with very few High rows shows every single one without sacrificing the Moderate or Low texture.
-
-8. **`tooltip` only, no `popup`.** Folium's tooltip fires on hover *and* on tap (covering both desktop and touch), so adding a separate `Popup` with the same content would double the per-marker HTML payload — at the 50 k-marker cap that's a meaningful difference (12 MB vs 24 MB at 10k). The spec asks for "Hover tooltip" anyway.
-
-9. **Per-marker CSS hoisted to a single `<style>` block in the document head.** Every tooltip's table styling (label colour, padding, font) used to be inlined per-marker — at 50 k markers that's pure waste because the styles are identical. The shared block lives in `<head>` and the per-marker HTML references the class names. Cuts the rendered file size by roughly half with zero visual change.
-
-10. **The 33%-TCC-missing finding from the first real run** drove a docs-only addition to `docs/data_sourcing.md` § "NLCD TCC NoData on non-tree land cover classes". The investigation (querying `enriched_locations.parquet` and cross-tabbing null tcc_pct against `land_cover_code`) confirmed it is NLCD's documented behaviour rather than a coverage gap — TCC is only computed for pixels where tree canopy is meaningful, which excludes Water (11), Developed High Intensity (24), Barren Land (31), Cultivated Crops (82), and most Grassland / Pasture / Emergent Wetland classes. The scoring code's "null TCC → tcc_score = 0.0" rule biases the published 5.84% High share down from the TCC-conditional 8.75%, and the documentation now flags this so a downstream reviewer sees both numbers.
-
-## Phase 11 — Agent monitoring metrics
-
-Phase 11 is the observability layer for every prior phase: a reviewer or on-call engineer should be able to point at a single JSONL log file and get an immediate read on per-stage health, Claude spend & correctness, and output quality. The decisions below all push toward making that one-command operation actually usable, not a science project.
-
-1. **The metrics module reads from JSONL, not from in-process state.** Every agent already writes through `PipelineLogger`, so the JSONL log is the single source of truth post-run. Pulling metrics from the log instead of in-memory tracker objects means the same module works on a historical run from last month and on the live pipeline that just exited — no need to instrument the orchestrator with a second tracker, no need for tests to fake an entire pipeline run.
-
-2. **`_load_events` returns `(events, parse_errors)` as a tuple, not a `list` subclass with a side-channel attribute.** The first draft attached `parse_errors` as an attribute on the returned list; Python's built-in `list` doesn't permit arbitrary attribute assignment, so the smoke test surfaced an `AttributeError` immediately. The tuple form is explicit, mypy-friendly, and one less place where someone could pickle the list and lose the count.
-
-3. **Malformed JSONL lines are skipped, counted, and surfaced — not raised.** A pipeline that crashes mid-batch can leave a half-flushed final line; raising on it would make the metrics module useless in exactly the case it's most needed (post-mortem on a failed run). The skipped-line count rolls up to `run.parse_errors` so the renderer flags it when non-zero.
-
-4. **Expected tool order is derived from `TOOLS` at call time, not hardcoded.** `_tool_call_accuracy` imports `src.agents.orchestrator.TOOLS` and uses `[t["name"] for t in TOOLS]` as the expected sequence. If a future phase adds a tool, reorders the flow, or renames `validate_results`, the accuracy check auto-updates. A test (`test_expected_order_reads_live_TOOLS`) pins this so a refactor that breaks the linkage fails CI.
-
-5. **Tool call accuracy reports four signals, not one.** `all_present` (set membership), `in_expected_order` (exact sequence equality), `missing` (which tools never ran), and `extra_or_repeated` (rogue tools or duplicates) cover the four failure modes a reviewer triages differently: a missing tool means a step was skipped, a duplicate means Claude retried (often a tool error symptom), an extra means a tool was added without updating the spec, and a wrong order means the dispatch loop is misbehaving. Surfacing all four lets the operator route the alert.
-
-6. **Cost is re-computed from token totals via `estimate_cost_usd`, not read from `COST_ESTIMATE.detail`.** The logged `estimated_cost_usd` is what *was* true at log-write time using *that* run's price constants. Re-computing from `total_input_tokens` + `total_output_tokens` + the current `config.CLAUDE_*_COST_PER_MTOK` rates means a post-hoc metrics rerun reflects the *current* pricing — useful when an annual contract bump changes the rates and historical runs need to be re-evaluated. The orchestrator's own logging path is unchanged.
-
-7. **Token totals come from the last `COST_ESTIMATE`, not the sum of all of them.** The orchestrator writes cumulative running totals on every Claude response, not deltas. Summing would double- and triple-count. A test pins this so a future refactor that switches to per-call deltas has to update the metrics module too.
-
-8. **Per-stage latency uses nearest-rank percentiles, not interpolated.** `statistics.quantiles` interpolates and requires ≥ 2 values; nearest-rank works on a single value, matches what observability tools like Datadog and Honeycomb emit, and is the convention an SRE expects when reading P50 / P95. The function is in-module rather than a numpy import so the metrics surface stays light on dependencies.
-
-9. **`_KNOWN_STAGES` is iterated explicitly, including zero-event stages.** A reviewer reading "scoring: 0 events" is a real signal — that stage was supposed to fire and didn't. A `defaultdict` over `e["stage"]` would silently omit empty stages from the output and the reader would never see the gap. The cost is one row of zeros per missing stage; the benefit is no missing signal.
-
-10. **Output quality accepts either the partitioned store dir OR a single-file parquet.** The Phase 8 partition store is the canonical home for scored data; the single-file workflow parquet is the intermediate the report generator consumes. Both are valid inputs because a partial run that wrote only the single file is still queryable, and a fully-merged run's partition store is the more authoritative source. Detection is `path.is_dir()`; the partition-store branch routes through `read_scored_locations` so the metric never goes through a parallel reader implementation.
-
-11. **The mean / median risk score is computed over scored rows only, not the full dataset.** UNSCORED rows have NaN `risk_score` by design (see `src.agents.scoring.score_components`). Including them by coercing NaN to 0 would systematically pull the mean down by the UNSCORED fraction — and a reader who sees "mean risk score = 0.15" would have no way to tell whether that's because the scoring is genuinely low or because half the dataset failed to enrich. Computing over scored rows keeps the metric interpretable; the UNSCORED count and pct are reported separately for completeness.
-
-12. **`format_metrics_text` is plain text, not markdown.** The metrics module is a *terminal* tool, not a document generator. A markdown render would either be unread (the user does `python -m src.utils.metrics ...` and gets raw markdown in their terminal) or require a pre-rendered HTML view that adds a dependency. Aligned ASCII columns are universally legible; the analyst who wants a rich report has `analysis_report.md` for that.
-
-13. **Drift detection is a documented strategy, not an automated check.** The Phase 11 spec asks for a drift detection *approach* in `docs/decision_log.md`, not a watchdog. The strategy reads "compare next quarter's tier proportions to this run; >5% shift in High triggers a NLCD version review" — a one-paragraph operational hook that an SRE can implement against `metrics["output_quality"]["tier_distribution"]` when the second baseline run exists. Wiring an automated check today would be one row of comparison against itself; the strategy is what's portable to the next rerun.
-
-14. **A schema-shape test pins `PipelineLogger` ↔ metrics module compatibility.** `test_load_events_matches_pipeline_logger_shape` writes a real event through `PipelineLogger` and asserts that every key the metrics module reads is present. A future logger refactor that renames `detail` to `payload` will fail this test before failing in production.
-
-## Phase 12 — Final polish & Phase-7 audit
-
-Phase 12 is the submission-readiness pass: shipped numbers go into the README, every doc that referenced the original per-batch design gets updated to the implemented pipeline-orchestration design, and every gap between the build plan and the codebase gets either closed or explicitly documented.
-
-1. **Real 4.67M-row numbers were threaded through every document that quoted "TBD" placeholders.** README.md's "Key Findings" was the headline change — the section now opens with the verified 19.7% / 31.1% / 49.3% / minimal-UNSCORED tier distribution, the $0.098 total cost, and the top-10 at-risk counties (with Wake, Mecklenburg, Durham, Buncombe leading on absolute count and Orange County leading on per-capita at 43.6%). Source: the full pipeline run completed on 2026-05-26. The smoke-run 10k numbers from Phase 9 are still referenced in `docs/data_sourcing.md` as the *first* signal of the TCC-missing pattern; the full-run 31.65% rate validates and slightly refines that earlier 33.29%.
-
-2. **Architecture diagram in `README.md` and `docs/architecture.md` rebuilt for the Phase 7 design.** The pre-Phase-12 diagram showed the original per-batch flow (Claude calling `fetch_tcc` / `fetch_elevation` / `compute_risk_score` per row) — that design was replaced in Phase 7 but the diagram never caught up. The new diagram shows the actual implementation: one orchestration session of approximately 6 turns, five pipeline-level tools, parquet artifacts between each step, and the Hive-partitioned store as the analytical surface. The Phase 3 raster tools are explicitly called out as internal Python helpers, not tools Claude dispatches. Without this fix a reviewer reading README.md → docs/architecture.md → `src/agents/orchestrator.py` would have hit two different architectures and not known which one to believe.
-
-9. **Interactive buffer search (Sample Agentic Scenario 3).** After `run_interactive` scores a coordinate, `find_better_alternatives` in `src/utils/geo.py` queries `scored_locations.parquet` for up to three nearby rows within a configurable radius (default 5 000 m via `config.INTERACTIVE_BUFFER_METERS`, overridable with `pipeline.py --buffer`) that have strictly lower `risk_score`. No extra Claude turns — pure haversine over a bbox pre-filter.
-
-10. **County filter on the Folium map.** `_CountyFilterControl` adds a dropdown of county GEOIDs from the scored parquet; markers are GeoJSON features with a `county` property so client-side JS can show/hide by selection without re-rendering the map server-side.
-
-3. **`docs/decision_log.md` gained a dedicated row for the Phase 7 pipeline-orchestration redesign.** The original table covered language, raster vs PostGIS, SDK choice, NLCD vs OSM, DuckDB, slope pre-computation, and model tier (Sonnet vs Opus) — but it was missing the single largest architectural decision in the project. The new row 7 documents the per-batch → pipeline-level redesign, the alternatives considered (per-batch / per-location), the verified $0.098 cost vs the $10,600 the per-batch design would have hit, and what we'd revisit (Anthropic Batches API once it supports `tool_use`).
-
-4. **Module docstrings in `src/tools/{tcc,elevation,landcover}.py`, `src/agents/{scoring,environmental,ingestion}.py` were updated to reflect the implemented Phase 7 architecture.** The pre-Phase-12 wording variously described `fetch_tcc` as "the `fetch_tcc` Claude tool (Phase 7)", claimed Claude reasons per-row about aspect for anomaly detection, and described `compute_risk_score` as "Phase 7's Claude `compute_risk_score` tool". None of those statements survived the Phase 7 redesign. The new wording calls each function what it actually is: an internal helper called by the orchestrator's `_run_*` methods, never exposed to Claude as `tool_use`. The historical context (what the build plan originally said vs what we shipped) is preserved in this file's § "Phase 7 — Claude Orchestrator architectural redesign".
-
-5. **`IngestionAgent.run()` default `batch_size` fixed from `config.CLAUDE_BATCH_SIZE` to `config.RASTER_BATCH_SIZE`.** Phase 7 removed `CLAUDE_BATCH_SIZE` from `config.py` because the pipeline-level redesign has no per-Claude-call batch sizing — but the AI_TOOLS Phase-7 decision log explicitly noted that "the docstring in `ingestion.py` was left stale" since the orchestrator always passes `batch_size` explicitly. Phase 12 closes the residual gap: standalone REPL / notebook use of `IngestionAgent.run(csv)` without an explicit batch_size would otherwise crash on `AttributeError: module 'src.config' has no attribute 'CLAUDE_BATCH_SIZE'`. Every existing test passes `batch_size` explicitly so this is internal-only and behaviour-preserving.
-
-6. **`README.md` gained a "Full-scale cost projection" table covering 10k / 100k / 4.67M / 50M rows.** Three of those four are verified (10k and 4.67M from real runs, 100k extrapolated from the same per-Claude-call cost); the 50M CONUS projection is an estimate. The framing makes the key property explicit: API cost is **essentially flat across dataset size** in this design — that's the economic payoff of the Phase 7 redesign, and it deserves a dedicated table so a reviewer doesn't have to back-derive it from the architecture description.
-
-7. **The README's `## AI tools used` section is the one-paragraph entry point** that points reviewers at `AI_TOOLS.md` for the full set of decisions. The README itself stays focused on the technical and operational story; the disclosure / divergence detail lives in `AI_TOOLS.md` so a reviewer with a specific compliance interest can read just that file.
-
-8. **"No other AI tools were used" is stated explicitly in `AI_TOOLS.md`.** Not GitHub Copilot, not ChatGPT, not Codex, not a LangChain-style framework. The native `anthropic` SDK is called out as a transport library rather than an AI tool — same distinction one would draw between `requests` and "AI usage". A reviewer should not have to infer the absence of a tool from a list of present ones.
-
-## Phase 4 follow-up — geoid_cb derivation
-
-1. The real locations.csv (handed over after Phase 6) carries a `geoid_cb` column instead of separate `state` / `county` columns, so ingestion now derives state abbreviation and county GEOID from the first 5 digits of the 15-digit Census Block GEOID — pure data-already-present extraction, no extra column to ask the user for.
-2. Explicit user-supplied `state` always wins over derived state, because future CSVs may include both columns and the user's explicit value is by definition more trustworthy than a derived one (and the test `test_explicit_state_wins_over_geoid` enforces the precedence).
-3. Derivation strictly requires exactly 15 digits, with NO zero-padding leniency, because an exporter that strips the leading zero from an Alabama row (`"01001…"` becoming `"1001…"`) produces a string indistinguishable from legitimate FIPS prefixes 10–19 (DE, DC, FL, GA, HI, ID, IL, IN, IA) — and silently mis-attributing a row to the wrong state would be worse than refusing to derive and letting the row pass with `state=None`.
-4. The reverse-lookup `STATE_FIPS_TO_ABBR` is built from `STATE_FIPS` at import time rather than hand-written as a second source of truth, because the two lookups must stay in sync forever and any future state-list edit (e.g. adding a territory if scope expands) should flow through one definition, not two.
-5. Non-CONUS state FIPS codes (AK=02, HI=15, PR=72, etc.) are intentionally absent from `STATE_FIPS_TO_ABBR`, because the pipeline is CONUS-only by design and silently deriving an unsupported state would make the row look more complete than it is — leaving state=None at this layer keeps the data-quality breadcrumb visible.
-6. The county field stores the canonical 5-digit county GEOID (state-FIPS + county-FIPS) rather than a human-readable county name, because a county lookup table would add ~3,100 hard-coded entries to config.py for marginal value at the ingestion layer — downstream code can join the 5-digit GEOID to a name table at report time if needed.
+The full build history and every phase-by-phase decision is documented separately and available on request.
