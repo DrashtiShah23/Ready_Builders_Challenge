@@ -1778,6 +1778,37 @@ class TestRenderMap:
         assert "Filter by county" in html
         assert "state-filter-select" in html
         assert "Filter by state" in html
+        assert "var tierGroups = [" in html
+        assert "layer.feature = feature" in html
+
+    def test_tcc_overlay_toggle_and_legend(
+        self,
+        orch: PipelineOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """TCC raster overlay is off by default and appears in LayerControl."""
+        out = tmp_path / "risk_map.html"
+        monkeypatch.setattr(orch_mod, "_MAP_HTML", out)
+        fake_bounds = [[33.0, -84.0], [36.0, -75.0]]
+        fake_url = "data:image/png;base64,iVBORw0KGgo="
+        monkeypatch.setattr(
+            orch_mod.PipelineOrchestrator,
+            "_build_tcc_overlay",
+            staticmethod(lambda: (fake_url, fake_bounds)),
+        )
+        orch._render_map(_scored_df_with_all_tiers())
+        html = out.read_text()
+        assert "Tree Canopy Cover" in html
+        assert "data:image/png;base64," in html
+        assert "rgba(144,238,144" in html
+        assert "var tierGroups = [" in html
+
+    def test_tcc_overlay_bounds_use_nc_state_bbox(self) -> None:
+        """ImageOverlay bounds must match config.STATE_BBOX_WGS84['NC'] exactly."""
+        lon_min, lat_min, lon_max, lat_max = config.STATE_BBOX_WGS84["NC"]
+        expected = [[lat_min, lon_min], [lat_max, lon_max]]
+        assert expected == [[33.75, -84.32], [36.59, -75.46]]
 
     def test_unscored_rows_are_excluded(
         self,

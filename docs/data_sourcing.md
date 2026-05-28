@@ -19,7 +19,7 @@ This document maps each dataset to an install guide obstruction factor and pins 
   </tr>
   <tr>
     <td>USGS 3DEP Elevation</td>
-    <td>https://www.usgs.gov/3d&#45;elevation&#45;program</td>
+    <td>https://www.usgs.gov/3d-elevation-program</td>
     <td>Terrain blocking the 25 degree minimum elevation angle and the sky cone</td>
     <td>National DEM that supports slope and aspect derivation</td>
   </tr>
@@ -31,6 +31,8 @@ This document maps each dataset to an install guide obstruction factor and pins 
   </tr>
 </table>
 
+The dataset choices were not arbitrary. Each one measures something the Starlink guide names explicitly as a cause of signal failure. Tree canopy cover measures the density of the thing the guide singles out by name, a tree branch. Terrain slope measures the terrain effect on the 25 degree minimum elevation clearance the dish needs. Land cover adds a cross check: if canopy says 75 percent and land cover confirms forest that is a confident reading. If they disagree that is a signal worth investigating. All three datasets come from the same 2021 data vintage, cover the entire continental US, and share compatible coordinate systems. Combining them required no reprojection conflicts or vintage reconciliation.
+
 ## Version pins
 
 <table>
@@ -41,7 +43,7 @@ This document maps each dataset to an install guide obstruction factor and pins 
   </tr>
   <tr>
     <td>NLCD canopy</td>
-    <td>Coverage id mrlc_download__nlcd_tcc_conus_2021_v2021&#45;4</td>
+    <td>Coverage id mrlc_download__nlcd_tcc_conus_2021_v2021-4</td>
     <td>src/config.py MRLC_TCC_COVERAGE_ID</td>
   </tr>
   <tr>
@@ -165,6 +167,8 @@ The downloader uses bbox and reads state bboxes from src/config.py STATE_BBOX_WG
     <td>State field not in the US state list</td>
   </tr>
 </table>
+
+Every quality issue found in the CSV was handled with a named reason code rather than silent exclusion. This makes the data quality audit fully transparent. A reviewer can see exactly how many rows were dropped and why, not just a final count. The most interesting finding was the geoid_cb column. The challenge brief described the CSV as having location_id, latitude, and longitude only. The actual CSV also included geoid_cb, a 15 digit Census Block GEOID that encodes the state FIPS code in its first two digits and the county FIPS in its first five. Rather than leaving state and county as null for every row I reverse engineered the derivation from the Census specification and added it at ingestion time. This gave the analysis full state and county breakdowns without any external geocoding API calls.
 
 ### geoid_cb column
 

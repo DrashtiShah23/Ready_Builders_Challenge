@@ -150,6 +150,15 @@ assert (
     abs(_MAP_QUOTA_HIGH + _MAP_QUOTA_MODERATE + _MAP_QUOTA_LOW - 1.0) < 1e-9
 ), "Map subsample tier quotas must sum to 1.0"
 
+# Folium's default ``marker=CircleMarker`` pointToLayer does not attach
+# ``feature`` to each Leaflet layer. The county filter reads
+# ``marker.feature.properties.county``, so we bind it explicitly.
+_GEOJSON_BIND_FEATURE_JS = """
+function (feature, layer) {
+    layer.feature = feature;
+}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Folium county filter (Phase 12)
@@ -157,7 +166,15 @@ assert (
 
 
 class _RegionFilterControl(MacroElement):
-    """Leaflet control: dropdowns to filter markers by state and county."""
+    """Leaflet control: dropdowns that swap visible marker groups.
+
+    This control does not attempt to hide individual markers inside a single
+    GeoJson layer. Instead it toggles whole Leaflet ``FeatureGroup`` layers:
+
+    1. Default view shows the three tier groups (LayerControl toggles).
+    2. Selecting a state hides the tier groups and shows the selected state group.
+    3. Selecting a county hides the tier groups and shows the selected county group.
+    """
 
     _template = Template(
         """
@@ -195,61 +212,122 @@ class _RegionFilterControl(MacroElement):
             var stateSelect = document.getElementById('state-filter-select');
             var countySelect = document.getElementById('county-filter-select');
             if (!stateSelect || !countySelect) return;
-            var tierGroupNames = {{ this.tier_group_names|tojson }};
+            var map = {{ this._parent.get_name() }};
+            var tierGroups = [{{ this.tier_group_names|join(', ') }}];
+            var stateGroups = {
+                {% for k, v in this.state_group_names.items() %}
+                "{{ k }}": {{ v }}{% if not loop.last %},{% endif %}
+                {% endfor %}
+            };
+            var countyGroups = {
+                {% for k, v in this.county_group_names.items() %}
+                "{{ k }}": {{ v }}{% if not loop.last %},{% endif %}
+                {% endfor %}
+            };
+            var activeGroup = null;
 
-            function applyToMarker(marker, selectedState, selectedCounty) {
-                var props = marker.feature && marker.feature.properties;
-                if (!props) return;
-                var st = props.state || '';
-                var cty = props.county || '';
-                var showState = !selectedState || st === selectedState;
-                var showCounty = !selectedCounty || cty === selectedCounty;
-                var show = showState && showCounty;
-                if (marker.setStyle) {
-                    marker.setStyle({
-                        opacity: show ? 0.85 : 0,
-                        fillOpacity: show ? 0.75 : 0
-                    });
+            function showTierGroups() {
+                if (activeGroup && map.hasLayer(activeGroup)) {
+                    map.removeLayer(activeGroup);
                 }
-                var el = marker.getElement && marker.getElement();
-                if (el) {
-                    el.style.display = show ? '' : 'none';
-                    el.style.pointerEvents = show ? '' : 'none';
+                activeGroup = null;
+                tierGroups.forEach(function(g) {
+                    if (g && !map.hasLayer(g)) map.addLayer(g);
+                });
+            }
+
+            function hideTierGroups() {
+                tierGroups.forEach(function(g) {
+                    if (g && map.hasLayer(g)) map.removeLayer(g);
+                });
+            }
+
+            function showGroup(g) {
+                if (activeGroup && map.hasLayer(activeGroup)) {
+                    map.removeLayer(activeGroup);
+                }
+                activeGroup = g;
+                if (activeGroup && !map.hasLayer(activeGroup)) {
+                    map.addLayer(activeGroup);
                 }
             }
 
-            function walkLayer(layer, selectedState, selectedCounty) {
-                if (layer.eachLayer) {
-                    layer.eachLayer(function(child) {
-                        walkLayer(child, selectedState, selectedCounty);
+            function debugLayers(label) {
+                try {
+                    console.log('[region-filter]', label, {
+                        selectedState: stateSelect.value,
+                        selectedCounty: countySelect.value,
+                        activeGroup: activeGroup ? true : false,
+                        tierGroupsCount: tierGroups.length
                     });
-                } else {
-                    applyToMarker(layer, selectedState, selectedCounty);
+                    tierGroups.forEach(function(g, i) {
+                        if (!g) return;
+                        console.log('[region-filter]', label, 'tierGroup', i, {
+                            name: g.options && g.options.name,
+                            onMap: map.hasLayer(g)
+                        });
+                    });
+                    var c = countySelect.value;
+                    if (c) {
+                        var cg = countyGroups[c];
+                        console.log('[region-filter]', label, 'countyGroup', c, {
+                            exists: !!cg,
+                            onMap: cg ? map.hasLayer(cg) : false
+                        });
+                    }
+                } catch (e) {
+                    console.log('[region-filter] debugLayers failed', e);
                 }
             }
 
             function applyFilters() {
                 var selectedState = stateSelect.value;
                 var selectedCounty = countySelect.value;
-                tierGroupNames.forEach(function(name) {
-                    var group = window[name];
-                    if (!group) return;
-                    walkLayer(group, selectedState, selectedCounty);
-                });
+                debugLayers('before');
+                if (selectedCounty) {
+                    hideTierGroups();
+                    showGroup(countyGroups[selectedCounty]);
+                    debugLayers('after_county');
+                    return;
+                }
+                if (selectedState) {
+                    hideTierGroups();
+                    showGroup(stateGroups[selectedState]);
+                    debugLayers('after_state');
+                    return;
+                }
+                showTierGroups();
+                debugLayers('after_clear');
             }
 
-            stateSelect.addEventListener('change', applyFilters);
-            countySelect.addEventListener('change', applyFilters);
+            stateSelect.addEventListener('change', function() {
+                console.log('[region-filter] state change', stateSelect.value);
+                applyFilters();
+            });
+            countySelect.addEventListener('change', function() {
+                console.log('[region-filter] county change', countySelect.value);
+                applyFilters();
+            });
         })();
         {% endmacro %}
         """
     )
 
-    def __init__(self, states: list[str], counties: list[str], tier_group_names: list[str]) -> None:
+    def __init__(
+        self,
+        states: list[str],
+        counties: list[str],
+        tier_group_names: list[str],
+        *,
+        state_group_names: dict[str, str],
+        county_group_names: dict[str, str],
+    ) -> None:
         super().__init__()
         self.states = states
         self.counties = counties
         self.tier_group_names = tier_group_names
+        self.state_group_names = state_group_names
+        self.county_group_names = county_group_names
 
 
 # ---------------------------------------------------------------------------
@@ -2296,6 +2374,87 @@ class PipelineOrchestrator:
             f"`{_rel(config.SCORED_DIR)}/state=*/part-0.parquet`\n"
         )
 
+    @staticmethod
+    def _build_tcc_overlay() -> Optional[tuple[str, list[list[float]]]]:
+        """Clip the NC TCC raster to the NC state bbox and return a PNG data URL + bounds.
+
+        Returns ``(data_url, bounds)`` for :class:`folium.raster_layers.ImageOverlay`,
+        or ``None`` when no raster is available or clipping fails. ImageOverlay bounds
+        are fixed to ``config.STATE_BBOX_WGS84["NC"]`` (not derived from scored rows).
+        """
+        import base64
+        import io
+
+        import matplotlib.colors as mcolors
+        import numpy as np
+        import rasterio
+        from matplotlib.image import imsave
+        from rasterio.windows import from_bounds
+        from rasterio.warp import transform_bounds
+
+        from src.tools.tcc import _find_tcc_raster
+
+        raster_path = _find_tcc_raster()
+        if raster_path is None:
+            return None
+
+        lon_min, lat_min, lon_max, lat_max = config.STATE_BBOX_WGS84["NC"]
+        bounds = [[lat_min, lon_min], [lat_max, lon_max]]
+
+        try:
+            with rasterio.open(raster_path) as src:
+                bounds_src = transform_bounds(
+                    "EPSG:4326",
+                    src.crs,
+                    lon_min,
+                    lat_min,
+                    lon_max,
+                    lat_max,
+                )
+                window = from_bounds(*bounds_src, transform=src.transform)
+                if window.width <= 0 or window.height <= 0:
+                    return None
+
+                data = src.read(1, window=window, boundless=True, fill_value=255)
+                height, width = data.shape
+
+                nodata = src.nodata if src.nodata is not None else 255
+                pct = np.clip(data.astype(np.float32), 0.0, 100.0)
+                mask = (data == nodata) | (data == 255) | (data < 0) | (data > 100)
+
+                cmap = mcolors.LinearSegmentedColormap.from_list(
+                    "tcc_overlay",
+                    [
+                        (0.0, 0.0, 0.0, 0.0),
+                        (144 / 255.0, 238 / 255.0, 144 / 255.0, 0.4),
+                        (0.0, 100 / 255.0, 0.0, 0.6),
+                    ],
+                )
+                rgba = cmap(pct / 100.0)
+                rgba[mask, 3] = 0.0
+
+                max_dim = 1024
+                if max(height, width) > max_dim:
+                    from PIL import Image
+
+                    scale = max_dim / float(max(height, width))
+                    new_w = max(1, int(width * scale))
+                    new_h = max(1, int(height * scale))
+                    img = Image.fromarray((rgba * 255).astype(np.uint8), mode="RGBA")
+                    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                    rgba = np.asarray(img).astype(np.float32) / 255.0
+
+                rgba = np.flipud(rgba)
+                buf = io.BytesIO()
+                imsave(buf, rgba, format="png")
+                data_url = (
+                    "data:image/png;base64,"
+                    + base64.b64encode(buf.getvalue()).decode("ascii")
+                )
+                return data_url, bounds
+        except Exception:
+            return None
+
     def _render_map(self, df: pd.DataFrame) -> None:
         """Render the Phase 10 interactive risk map to ``_MAP_HTML``.
 
@@ -2341,7 +2500,9 @@ class PipelineOrchestrator:
         # we don't want them on the cold-start path of every test that
         # imports ``orchestrator``.
         import folium
+        from folium import JsCode
         from folium.plugins import MarkerCluster
+        from folium.raster_layers import ImageOverlay
 
         sample = self._sample_for_map(df)
         if sample.empty:
@@ -2358,6 +2519,22 @@ class PipelineOrchestrator:
             control_scale=True,
         )
 
+        include_tcc_legend = False
+        tcc_overlay = self._build_tcc_overlay()
+        if tcc_overlay is not None:
+            data_url, overlay_bounds = tcc_overlay
+            tcc_group = folium.FeatureGroup(name="Tree Canopy Cover", show=False)
+            ImageOverlay(
+                image=data_url,
+                bounds=overlay_bounds,
+                opacity=0.4,
+                name="Tree Canopy Cover",
+                interactive=False,
+                cross_origin=False,
+            ).add_to(tcc_group)
+            tcc_group.add_to(m)
+            include_tcc_legend = True
+
         states = sorted(
             {
                 str(s)
@@ -2373,6 +2550,76 @@ class PipelineOrchestrator:
             }
         )
         tier_group_names: list[str] = []
+        state_group_names: dict[str, str] = {}
+        county_group_names: dict[str, str] = {}
+
+        def _color_for_tier(tier: str) -> str:
+            return {
+                TIER_HIGH: _TIER_COLOR_HIGH,
+                TIER_MODERATE: _TIER_COLOR_MODERATE,
+                TIER_LOW: _TIER_COLOR_LOW,
+            }.get(tier, _TIER_COLOR_LOW)
+
+        def _tooltip_html_from_row(row: Any) -> str:
+            props = {
+                "location_id": getattr(row, "location_id", None),
+                "state": getattr(row, "state", None),
+                "county": getattr(row, "county", None),
+                "risk_tier": getattr(row, "risk_tier", None),
+                "risk_score": getattr(row, "risk_score", None),
+                "tcc_pct": getattr(row, "tcc_pct", None),
+                "slope_deg": getattr(row, "slope_deg", None),
+                "land_cover_class": getattr(row, "land_cover_class", None),
+            }
+            return self._marker_html_from_props(props)
+
+        def _add_circle_markers(target_df: pd.DataFrame, container: Any) -> None:
+            """Add clustered CircleMarkers with per-marker tooltips."""
+            cluster = MarkerCluster(
+                disableClusteringAtZoom=_MARKER_CLUSTER_DISABLE_ZOOM,
+                showCoverageOnHover=False,
+            )
+            for row in target_df.itertuples(index=False):
+                tier = str(getattr(row, "risk_tier", ""))
+                color = _color_for_tier(tier)
+                folium.CircleMarker(
+                    location=[float(row.latitude), float(row.longitude)],
+                    radius=4,
+                    color=color,
+                    weight=1,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.75,
+                    tooltip=folium.Tooltip(
+                        _tooltip_html_from_row(row),
+                        sticky=True,
+                    ),
+                ).add_to(cluster)
+            cluster.add_to(container)
+
+        # Build hidden state groups for dropdown swapping.
+        for st in states:
+            st_df = sample[sample["state"] == st]
+            if st_df.empty:
+                continue
+            st_group = folium.FeatureGroup(
+                name=f"State {st}", show=False, control=False
+            )
+            _add_circle_markers(st_df, st_group)
+            st_group.add_to(m)
+            state_group_names[st] = st_group.get_name()
+
+        # Build hidden county groups for dropdown swapping.
+        for cty in counties:
+            cty_df = sample[sample["county"] == cty]
+            if cty_df.empty:
+                continue
+            cty_group = folium.FeatureGroup(
+                name=f"County {cty}", show=False, control=False
+            )
+            _add_circle_markers(cty_df, cty_group)
+            cty_group.add_to(m)
+            county_group_names[cty] = cty_group.get_name()
 
         # One FeatureGroup per tier so the LayerControl gets per-tier
         # checkboxes. ``show=True`` on Moderate/High means the reviewer
@@ -2403,41 +2650,20 @@ class PipelineOrchestrator:
                 disableClusteringAtZoom=_MARKER_CLUSTER_DISABLE_ZOOM,
                 showCoverageOnHover=False,
             )
-            folium.GeoJson(
-                self._dataframe_to_geojson(tier_df),
-                marker=folium.CircleMarker(
+            for row in tier_df.itertuples(index=False):
+                folium.CircleMarker(
+                    location=[float(row.latitude), float(row.longitude)],
                     radius=4,
                     color=color,
                     weight=1,
                     fill=True,
                     fill_color=color,
                     fill_opacity=0.75,
-                ),
-                tooltip=folium.GeoJsonTooltip(
-                    fields=[
-                        "location_id",
-                        "state",
-                        "county",
-                        "risk_tier",
-                        "risk_score",
-                        "tcc_pct",
-                        "slope_deg",
-                        "land_cover_class",
-                    ],
-                    aliases=[
-                        "Location",
-                        "State",
-                        "County",
-                        "Risk tier",
-                        "Risk score",
-                        "Tree canopy",
-                        "Slope",
-                        "Land cover",
-                    ],
-                    labels=True,
-                    sticky=True,
-                ),
-            ).add_to(cluster)
+                    tooltip=folium.Tooltip(
+                        _tooltip_html_from_row(row),
+                        sticky=True,
+                    ),
+                ).add_to(cluster)
             cluster.add_to(group)
             group.add_to(m)
 
@@ -2448,11 +2674,19 @@ class PipelineOrchestrator:
         folium.LayerControl(collapsed=False).add_to(m)
 
         if states or counties:
-            _RegionFilterControl(states, counties, tier_group_names).add_to(m)
+            _RegionFilterControl(
+                states,
+                counties,
+                tier_group_names,
+                state_group_names=state_group_names,
+                county_group_names=county_group_names,
+            ).add_to(m)
 
         # The colour legend lives in the bottom-left so it doesn't
         # collide with the LayerControl on the top-right.
-        m.get_root().html.add_child(folium.Element(self._legend_html()))
+        m.get_root().html.add_child(
+            folium.Element(self._legend_html(include_tcc=include_tcc_legend))
+        )
 
         # Hoist the tooltip's repeated inline styles into a single
         # ``<style>`` block in the document head. Each tooltip then
@@ -2525,13 +2759,47 @@ class PipelineOrchestrator:
                 if spare == 0:
                     break
 
-        return pd.concat(
+        base = pd.concat(
             [
                 high.head(actual[TIER_HIGH]),
                 moderate.head(actual[TIER_MODERATE]),
                 low.head(actual[TIER_LOW]),
             ]
         )
+        if "county" not in scored.columns:
+            return base
+        # Ensure the dropdown can reliably filter to any county by guaranteeing
+        # that every county contributes at least one marker to the rendered map.
+        rendered_counties = {
+            str(c) for c in base["county"].dropna().unique() if str(c).strip()
+        }
+        all_counties = {
+            str(c) for c in scored["county"].dropna().unique() if str(c).strip()
+        }
+        missing = sorted(all_counties - rendered_counties)
+        if not missing:
+            return base
+
+        # Take a tiny slice per missing county, then append until the cap.
+        extras: list[pd.DataFrame] = []
+        remaining = _MAP_MAX_POINTS - len(base)
+        if remaining <= 0:
+            # Base sample already consumes the full marker budget, so reserve
+            # a small slice to ensure county coverage.
+            remaining = min(len(missing), 1000)
+            base = base.head(max(0, _MAP_MAX_POINTS - remaining))
+        for cty in missing:
+            one = scored[scored["county"] == cty].head(1)
+            if one.empty:
+                continue
+            extras.append(one)
+            remaining -= 1
+            if remaining <= 0:
+                break
+        if not extras:
+            return base
+        combined = pd.concat([base, *extras]).drop_duplicates(subset=["location_id"])
+        return combined.head(_MAP_MAX_POINTS)
 
     @staticmethod
     def _dataframe_to_geojson(df: pd.DataFrame) -> dict[str, Any]:
@@ -2673,7 +2941,7 @@ class PipelineOrchestrator:
         )
 
     @staticmethod
-    def _legend_html() -> str:
+    def _legend_html(include_tcc: bool = False) -> str:
         """Inline HTML legend pinned to the map's bottom-left corner.
 
         Uses absolute positioning relative to the Leaflet container, a
@@ -2693,6 +2961,19 @@ class PipelineOrchestrator:
             f"<span>{label}</span></div>"
             for color, label in items
         )
+        tcc_block = ""
+        if include_tcc:
+            tcc_block = (
+                "<div style='margin-top:8px;padding-top:6px;border-top:1px solid #ddd'>"
+                "<div style='font-weight:600;margin-bottom:4px'>Tree Canopy Cover</div>"
+                "<div style='height:14px;width:140px;"
+                "background:linear-gradient(to right,"
+                "rgba(0,0,0,0),"
+                "rgba(144,238,144,0.6),"
+                "rgba(0,100,0,0.9));"
+                "border:1px solid #bdc3c7;border-radius:2px'></div>"
+                "</div>"
+            )
         return (
             "<div style='position:fixed;bottom:24px;left:12px;z-index:9999;"
             "background:rgba(255,255,255,0.95);padding:10px 14px;"
@@ -2701,7 +2982,7 @@ class PipelineOrchestrator:
             "font-size:12px;color:#2c3e50'>"
             "<div style='font-weight:700;margin-bottom:4px'>"
             "LEO obstruction risk</div>"
-            f"{rows}"
+            f"{rows}{tcc_block}"
             "</div>"
         )
 
